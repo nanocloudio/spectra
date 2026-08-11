@@ -1,0 +1,39 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# G.711 µ-law telephony codec — the bidirectional PCM ↔ µ-law bridge for a
+# two-party voice path. Encode averages stereo PCM to mono µ-law for the RTP
+# transmitter; decode expands received µ-law back to stereo PCM for playout.
+# The companding math is `modules/common/g711.rs`, shared verbatim
+# with the host tests; this module is the channel/port wrapper only.
+
+[[ports]]
+name = "pcm_in"
+index = 0
+direction = "input"
+content_type = "AudioSample"
+
+[[ports]]
+name = "ulaw_out"
+index = 0
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ulaw_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "pcm_out"
+index = 1
+direction = "output"
+content_type = "AudioSample"
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+[observability]
+exempt = "codec module — byte throughput is observed at the RTP transport it feeds"

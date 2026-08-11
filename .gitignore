@@ -1,0 +1,26 @@
+/.context/
+/target/
+# Cargo output. The three host crates — tests/harness, tools/hevc,
+# benches/spectra-bench — each declare their own [workspace], so `cargo build`
+# in any of them writes a sibling target/. All derived; the PIC build ignores
+# them. `.git-shadow/info/exclude` carries the same rule as `**/target/`, and
+# note the double star: `*/target/` matches only one level and let 2273 build
+# artefacts into the shadow repo before it was caught.
+target/
+/deps/
+/.idea/
+/.vscode/
+.DS_Store
+*.log
+*.tmp
+
+
+# Shadow-tracked (see standards/test-tracking.md) — versioned in
+# .git-shadow/, never pushed to this repo's remote. `fuzz/` is omitted
+# until that tier exists; add it here and in .git-shadow/info/exclude
+# together if it is introduced.
+/tests/
+/benches/
+/examples/
+/fixtures/
+/.git-shadow/

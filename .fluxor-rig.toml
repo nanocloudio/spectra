@@ -1,0 +1,89 @@
+# Rig build recipes for Spectra. Consumed by `fluxor rig test|run`.
+#
+# WHY THIS IS IN-TREE AND NOT ~/.config/fluxor/projects/spectra/rig.toml
+#
+# Every sibling (wave, lattice, clustor, zedex, sector) keeps its recipe under
+# `$XDG_CONFIG_HOME`, and the CLI accepts either. Spectra deviates on purpose:
+# a machine-local recipe means a fresh clone cannot run a rig scenario until
+# someone remembers to hand-write this file, and "it only exists on one
+# machine" is precisely the failure mode `standards/test-tracking.md` §1 was
+# written to close out. There is nothing secret here to justify the risk —
+# this file holds BUILD steps only. Rig topology (DUT address, power backend,
+# serial device) stays in the private lab profile at
+# `~/.config/fluxor/labs/<lab>/rigs/<rig>.toml`, which is where it belongs and
+# is not versioned anywhere.
+#
+# Commands run from the project source root; output paths resolve against it.
+# `${scenario.config}` resolves at plan time to the scenario's `config = "…"`
+# and arrives as `$1`.
+
+# Pi 5 bare-metal.
+#   fluxor rig test --scenario tests/hardware/pi5_codec_audio_variant.toml
+#
+# Spectra has no firmware of its own — kernel, transports and drivers are all
+# Fluxor's. `fluxor build` for pi5 wants target/pi5/firmware.bin in the PROJECT
+# root, so the recipe stages it out of the deps/fluxor pin rather than making a
+# fresh checkout copy it by hand.
+[build.pi5]
+command = [
+    "bash",
+    "-c",
+    """
+set -euo pipefail
+
+# 1. Stage Fluxor's kernel firmware, building it in the pinned tree if absent.
+if [ ! -f deps/fluxor/target/pi5/firmware.bin ]; then
+  make -C deps/fluxor firmware TARGET=pi5
+fi
+mkdir -p target/pi5/images
+if ! cmp -s deps/fluxor/target/pi5/firmware.bin target/pi5/firmware.bin 2>/dev/null; then
+  cp deps/fluxor/target/pi5/firmware.bin target/pi5/firmware.bin
+fi
+
+# 2. Build Spectra's codec for the target silicon.
+#
+#    Unconditionally, every run. `fluxor run` and `fluxor build` resolve the
+#    PREBUILT fmod, so editing module source without rebuilding silently
+#    deploys the previous module — an arena change was measured against a stale
+#    fmod exactly once during T2.2.4 before this was understood. That is
+#    standards/rig.md §4's build-freshness trap, and it applies to the host
+#    path too.
+fluxor modules build --target bcm2712
+
+# 3. Purge any 0-byte fmods before combining. A truncated module is accepted
+#    here and rejected later by the image builder with a message that points at
+#    the image rather than the module; 50 of Fluxor's own bcm2712 fmods were
+#    0 bytes on 2026-07-26 (rig.md §4). Fail loudly and early instead.
+find target/fluxor/bcm2712/modules -name '*.fmod' -size -72c -print -delete 2>/dev/null | \\
+  while read -r f; do echo "rig recipe: removed truncated $f — rebuild it" >&2; done
+
+fluxor build "$1"
+
+# 4. Surface the image at a stable path so ANY scenario deploys, not just the
+#    one whose stem matches `artifact` below. `fluxor build` mirrors the
+#    config's subdirectory under images/ (examples/audio_variant/pi5.yaml ->
+#    images/audio_variant/pi5.img), so find it by name rather than assuming a
+#    flat layout.
+#    Resolve by the config's OWN mirrored path, not by basename. Every example
+#    config is named `pi5.yaml`, so a bare `find -name "$STEM.img" | head -1`
+#    matches EVERY example's image and picks an arbitrary one — it silently
+#    booted hevc_probe's image for an hevc_decode scenario on 2026-07-28, which
+#    reads as "my module produced no output" rather than "you ran the wrong
+#    image". That is exactly standards/rig.md §4's staging trap.
+STEM="$(basename "$1" .yaml)"
+PARENT="$(basename "$(dirname "$1")")"
+DST=target/pi5/images/spectra-pi5.img
+SRC="target/pi5/images/$PARENT/$STEM.img"
+if [ ! -f "$SRC" ]; then
+  # Configs sitting directly in the config root have no mirrored subdirectory.
+  SRC="target/pi5/images/$STEM.img"
+fi
+[ -f "$SRC" ] || { echo "rig recipe: no image at target/pi5/images/$PARENT/$STEM.img" >&2; exit 1; }
+# Guard against a stale image: it must be newer than the build we just ran.
+find "$SRC" -newermt '-10 minutes' | grep -q . || { echo "rig recipe: $SRC is stale (>10 min old) — build did not refresh it" >&2; exit 1; }
+[ "$SRC" -ef "$DST" ] || cp "$SRC" "$DST"
+""",
+    "_",
+    "${scenario.config}",
+]
+artifact = "target/pi5/images/spectra-pi5.img"

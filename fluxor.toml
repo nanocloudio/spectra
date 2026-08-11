@@ -1,0 +1,75 @@
+# Spectra project configuration consumed by the `fluxor` CLI.
+# See ~/Development/nanocloudio/standards/{ci,tests,fluxor-modules,dependencies}.md.
+
+[project]
+name    = "spectra"
+version = "0.0.1"
+
+# fluxor provides the module SDK source (abi.rs, runtime.rs, params.rs,
+# varint.rs, wasm_entry.rs, the PIC linker script) materialised into
+# target/fluxor/fluxor-abi/sdk/, plus the `fluxor-linux` runtime binary.
+# `modules/app/codec/mod.rs` `include!`s that SDK; Spectra never vendors a
+# second copy of it.
+[dependencies]
+fluxor = "0.0.1"
+# Protocol modules (http, ws_stream, rtp, websocket) live in wave since the
+# extraction; fluxor's copy is now `http_edge` (workload-ingress variant).
+wave   = "0.0.1"
+
+[required]
+fluxor = { abi = 1 }
+
+[ci]
+# Silicon targets `fluxor modules build --all` produces artefacts for. Which
+# modules build for which silicon is decided per module by `manifest.toml`'s
+# `hardware_targets`; `codec` declares all three. `linux` is a *runtime* host,
+# not a silicon, so it is not listed here — the Linux path is exercised by
+# `fluxor run`.
+targets = ["rp2350", "bcm2712", "wasm"]
+
+[ci.cargo]
+host_tools_crate = "tests/harness"
+
+# No root manifest.
+#
+# Spectra's shared sources are `modules/common/**` — a SOURCE TREE published as
+# `spectra-common` (dependencies.md §1), not a crate. Sibling projects do not
+# define crates; `crates/spectra-cores` was retired and its cores moved there,
+# which is also what removed the root workspace.
+#
+# The consequences, and where each is covered:
+#   * phases 1.1/1.2 see no root manifest and fmt-check + clippy the PIC module
+#     sources DIRECTLY — new coverage, since `modules/**` had neither before;
+#   * phase 2 is omitted rather than skipped; the host crates it would have run
+#     are covered by phase 4 (`cargo-test (harness)`, built in) and by
+#     `tools/ci/host_crates.sh` below, which lints and builds all three.
+
+# No `[[ci.lints.exemption]]`: the opt-in audit it feeds matches exemptions
+# against workspace-member PATHS and is omitted entirely without a root
+# manifest. `benches/spectra-bench` and `tools/hevc` still inline their
+# own relaxed `[lints]` mirrors — there is simply no workspace left to opt out
+# of.
+
+[ci.hygiene]
+# `modules/**` are no_std PIC objects that cannot host a test harness, so inline
+# tests there are a real error. Codec conformance vectors live under `tests/`
+# against `modules/common` and the host-rlib module build, both ordinary
+# host Rust.
+forbid_inline_tests = ["modules"]
+mode                = "strict"
+
+[ci.test]
+# CI phase 3.5 project gates, in order:
+#   1. shadow_guard.sh — shadow-checkout hard-fail (test-tracking.md §7):
+#      tests/ is shadow-tracked in .git-shadow/, so a primary-only checkout
+#      has zero files there and the test phases would pass vacuously.
+#   2. host_crates.sh — with no root workspace, nothing else lints the three
+#      standalone host crates, and nothing at all builds two of them.
+#   3. pic_link_check.sh — 32-bit PIC linkage guard: a u64 division or float
+#      cast in `modules/common` emits __aeabi helpers that do not link
+#      on rp2350, and a module build compiles only the cores it mounts.
+scripts = [
+  "tools/ci/shadow_guard.sh",
+  "tools/ci/host_crates.sh",
+  "tools/ci/pic_link_check.sh",
+]

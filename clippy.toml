@@ -1,0 +1,34 @@
+# Clippy configuration for the PIC module sources.
+#
+# `msrv` is the load-bearing key. `fluxor ci` clippies `modules/**` directly
+# with `clippy-driver` — there is no root manifest to lint instead, since the
+# root workspace went with `crates/spectra-cores` when the cores moved to
+# `modules/common/**` — and clippy-driver reads THIS file, not a `Cargo.toml`.
+# Without the key clippy assumes whatever toolchain is installed, which changes
+# which lints fire in both directions: too low and it rejects APIs the modules
+# already use, too high and it demands newer ones. Neither failure names its own
+# cause.
+#
+# WHY 1.87 AND NOT THE 1.81 FLOOR IN ../standards/lints.md §0. That standard
+# sets a floor, and these modules are already past it. `is_multiple_of` on the
+# integer types stabilised in 1.87 and is used in four files:
+#
+#   modules/app/codec/mod.rs        (3x, the heartbeat cadences)
+#   modules/app/hevc_decode/mod.rs  (2x)
+#   modules/app/hevc_probe/mod.rs   (1x)
+#   modules/common/hevc.rs          (1x, byte-alignment in the slice parser)
+#
+# Those replaced `x % n == 0` forms that clippy's own `manual_is_multiple_of`
+# demanded once `modules/**` started being linted at all — which is new: before
+# the workspace was retired, nothing linted the PIC sources, so nothing ever
+# checked them against an MSRV either. `div_ceil` (1.73), `NonZeroUsize::MIN`
+# (1.70) and `reason = "..."` on lint attributes (1.81) are all below this, so
+# 1.87 is the binding constraint.
+#
+# So this is not a relaxation — it is the first honest statement of what the
+# modules have required since they were first linted. Lowering it to 1.81 would
+# mean rewriting working device code to satisfy a number no build enforces.
+#
+# Raise this only alongside a deliberate decision about which silicon toolchains
+# must still build Spectra.
+msrv = "1.87"

@@ -1,0 +1,32 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+# `platform_raw` gates raw MMIO (0x0CE4/0x0CE5); `dma` separately gates DMA
+# buffer allocation and cache maintenance (0x0CE6/0x0CE7/0x0CEA-0x0CEC). The
+# kernel split the two — a module that only reads registers should not be able
+# to allocate contiguous physical memory — so this driver, which does both,
+# must declare both. `hevc_probe` reads one register and correctly needs only
+# the first.
+permissions = ["platform_raw", "dma"]
+
+# BCM2712 HEVC phase-1 execution probe — rung 3 of the bare-metal bring-up
+# ladder, after the version read (rung 1) and the DMA round-trip (rung 2).
+#
+# Allocates DMA buffers, stages an embedded single-slice intra HEVC NAL,
+# assembles the phase-1 command list with the real modules/common assembler,
+# launches the entropy engine, and POLLS P1_LIST_DONE. The question it answers:
+# does the engine fetch and consume the command list we built from the
+# clean-room spec? Polling avoids needing an IRQ binding for this rung.
+#
+# On overflow it reports the P1_CHECKPOINT bits, which is how the spec says to
+# distinguish "buffers too small" from "bitstream undecodable" (§5, §6.4).
+timer_class = "agnostic"
+
+[[ports]]
+name = "probe_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "HEVC phase-1 bring-up probe — runs one decode attempt and logs the outcome; emits no sustained byte stream"

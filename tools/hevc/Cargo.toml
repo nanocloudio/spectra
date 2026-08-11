@@ -1,0 +1,26 @@
+[package]
+name = "spectra-hevc-tools"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Host-side driver tools for Spectra's bare-metal HEVC bring-up"
+
+# Stands alone with its own `[workspace]`, like `tests/harness` and
+# `benches/spectra-bench`. The project has no root manifest — sibling projects
+# do not define crates (`dependencies.md` §1), and the shared sources these
+# binaries drive live in `modules/common/**`, MOUNTED below rather than linked.
+#
+# These were `cargo --example`s of the deleted `spectra-cores` crate. They are
+# binaries, not examples: `hevc_precompute` GENERATES a tracked source file
+# (`modules/app/hevc_decode/clip.rs`) that the bare-metal driver compiles, and
+# `--expect-certified` is a regression gate over the silicon-certified
+# constants. That is tooling, not illustration.
+[workspace]
+
+[lints.rust]
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"

@@ -1,0 +1,33 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+# `platform_raw` for the MMIO version read (0x0CE4); `dma` for the rung-2
+# round-trip (0x0CE6 alloc + 0x0CEA/0x0CEB cache maintenance), which the kernel
+# gates separately. The two were one permission until upstream split them; this
+# module declared only the first, so its DMA stage began failing silently —
+# `pi5_hevc_probe` kept passing because its pass rule only covers the version
+# read, and `pi5_hevc_dma` is the rung that actually checks it.
+permissions = ["platform_raw", "dma"]
+
+# BCM2712 HEVC decode block bring-up probe. The first bare-metal contact with
+# the block: it reads the hardware version register (spec r01/r02 §2/§6.1,
+# expected value 0x202) over the mediated MMIO_READ32 syscall and logs it, so
+# a rig run answers two questions at once — is the block's MMIO reachable from
+# bare metal, and did the VPU firmware leave it clocked at handoff (as it does
+# the GEM NIC), or does the clock still need enabling.
+#
+# No decode and no interrupts. It DOES do a DMA round-trip (rung 2, checked
+# by `pi5_hevc_dma.toml`) — this comment claimed otherwise for longer than the
+# code did. This is deliberately the
+# smallest possible step per standards/rig.md — prove one thing before adding
+# the next.
+timer_class = "agnostic"
+
+[[ports]]
+name = "probe_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "HEVC block bring-up probe — reads one register and logs it; emits no sustained byte stream"
