@@ -63,5 +63,3 @@ max_record = 16384
 [observability]
 exempt = "audio/media-sample path — meaningful throughput is sample-rate (Hz·channels), not byte count; off-device bytes are observed at the network transport"
 
-[test]
-harness = "tests/harness.rs"
