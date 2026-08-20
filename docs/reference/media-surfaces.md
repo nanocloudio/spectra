@@ -1,6 +1,10 @@
 # Media surface boundary
 
-Fluxor owns the canonical names and on-wire identifiers. Spectra consumes them.
+Fluxor owns the canonical content-type names and their on-wire
+identifiers. Spectra consumes them: its manifests name these surfaces
+on module ports (source: `modules/app/codec/manifest.toml`,
+`modules/app/g711/manifest.toml`) and never assign replacement numeric
+identifiers.
 
 | Surface | Meaning | Spectra role |
 | --- | --- | --- |
@@ -13,9 +17,14 @@ Fluxor owns the canonical names and on-wire identifiers. Spectra consumes them.
 | `EventTimelineAudio` | Frame-aligned audio event timeline | Consume only through a declared adapter |
 | `EventTimelineVideo` | Frame-aligned video event timeline | Consume only through a declared adapter |
 
-`VideoDraw` and `VideoScanout` normally belong to rendering and presentation
-rather than codecs. Codec modules must not infer dimensions, sample rate,
-channel layout, colour model, stride, time base, or ownership where the public
-contract does not carry them. Such metadata requires an explicit Fluxor-owned
-surface revision or a declared graph binding.
+Encoded surfaces are generic: `AudioEncoded` carries any audio codec's
+access units and `VideoEncoded` any video codec's. Codec identity
+travels in-band (encoded access units and container formats are
+self-describing) or as a capability fact on the wiring edge, never as
+a per-codec content type.
 
+`VideoDraw` and `VideoScanout` belong to rendering and presentation
+rather than codecs. Codec modules must not infer dimensions, sample
+rate, channel layout, colour model, stride, time base, or ownership
+where the public contract does not carry them; such metadata requires
+an explicit fluxor-owned surface revision or a declared graph binding.

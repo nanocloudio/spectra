@@ -14,7 +14,7 @@
 # not.
 #
 # The flags are the CI-comparable ones: changing them makes a run
-# incomparable with the numbers recorded in docs/testing/perf-benchmarks.md, so
+# incomparable with the numbers recorded in .context/performance_baselines.md, so
 # change them deliberately and re-baseline that document in the same commit.
 #
 # Conditions matter more than the flags. Numbers from a loaded or hot board are

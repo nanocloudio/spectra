@@ -1,5 +1,4 @@
 # Spectra project configuration consumed by the `fluxor` CLI.
-# See ~/Development/nanocloudio/standards/{ci,tests,fluxor-modules,dependencies}.md.
 
 [project]
 name    = "spectra"
@@ -33,7 +32,7 @@ host_tools_crate = "tests/harness"
 # No root manifest.
 #
 # Spectra's shared sources are `modules/common/**` — a SOURCE TREE published as
-# `spectra-common` (dependencies.md §1), not a crate. Sibling projects do not
+# `spectra-common`, not a crate. Sibling projects do not
 # define crates; `crates/spectra-cores` was retired and its cores moved there,
 # which is also what removed the root workspace.
 #
@@ -60,7 +59,7 @@ mode                = "strict"
 
 [ci.test]
 # CI phase 3.5 project gates, in order:
-#   1. shadow_guard.sh — shadow-checkout hard-fail (test-tracking.md §7):
+#   1. shadow_guard.sh — shadow-checkout hard-fail:
 #      tests/ is shadow-tracked in .git-shadow/, so a primary-only checkout
 #      has zero files there and the test phases would pass vacuously.
 #   2. host_crates.sh — with no root workspace, nothing else lints the three

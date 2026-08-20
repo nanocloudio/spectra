@@ -14,8 +14,7 @@ Builds for rp2350 and bcm2712 — the same targets as Wave's `rtp` and `sip`,
 which are what sit on the other side of both ports.
 
 The companding math is **not here**: it is `modules/common/g711.rs`,
-`#[path]`-mounted so the module and the host vector tests
-(`tests/g711_vectors.rs`) compile the same bytes. This module is the channel
+`#[path]`-mounted so every consumer compiles the same bytes. This module is the channel
 wrapper — polling, backpressure, and frame alignment — and nothing else.
 
 ## Ports
@@ -56,5 +55,5 @@ The decode direction needs no equivalent: µ-law is one byte per sample.
 
 ## Provenance
 
-Relocated from `fluxor/modules/app/voip` (the encode and decode halves) under
-Conclave plan S4.2, `Move G.711 to Spectra` — T4.2.2 module wrapping.
+Relocated from fluxor: the encode and decode halves of its former voip
+module, rewrapped here as one bidirectional module.

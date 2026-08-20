@@ -28,8 +28,6 @@ video/           essence: moving raster
 container/       muxed streams, kept orthogonal to the codecs they carry
   mod.rs           façade + sniffing
   matroska.rs      mounted from modules/common (see below)
-tests/
-  harness.rs       hermetic module-test lane (`fluxor test`)
 ```
 
 Two rules hold everywhere, which is the whole point of the shape:
@@ -95,7 +93,7 @@ unwired.
 
 ## Variants
 
-`manifest.toml` declares two (RFC `module_variants`):
+`manifest.toml` declares two:
 
 - **`full`** (default, ships as `codec.fmod`) — every family.
 - **`audio`** (`codec-audio.fmod`) — `wav`+`mp3`+`aac` only. Drops the
@@ -117,25 +115,12 @@ macro-spliced into a `mod` body.
 
 The SDK (`abi.rs`, `runtime.rs`, `params.rs`) is mounted the same way from
 `target/fluxor/fluxor-abi/sdk/`, materialised by `fluxor sync`. It is
-gitignored, so `make lint` / `make test` / `make bench` declare it as a
-prerequisite; a bare `cargo` invocation in a freshly-cleaned tree will
+gitignored, so a bare `cargo` invocation in a freshly-cleaned tree will
 fail to resolve `mod abi` until you have synced.
-
-## Testing
-
-Two lanes:
-
-- **Hermetic** (`tests/harness.rs`, run by `fluxor test`) — the AAC table
-  provenance proof, which recomputes the tables from their defining
-  formulas and touches no syscall table.
-- **Channel-driven** (`tests/harness/tests/`, run by `make test`) — drives
-  the module against mock channels: dispatcher, WAV, image frames, MKV
-  video, DEFLATE, and the bank↔codec file-cycling suite. Every host suite
-  in the project lives there; it is the only test crate.
 
 ## Porting or validating a new sub-codec
 
-Follow `docs/guides/codec_porting.md`. The short version:
+The short version:
 
 1. Get a byte-exact upstream reference building locally with intermediate
    spectrum dumps.
@@ -148,15 +133,13 @@ Follow `docs/guides/codec_porting.md`. The short version:
 
 ## Provenance
 
-Relocated from `fluxor/modules/app/codec` on 2026-07-26 (T2.2.1).
-Per-area licence provenance is inventoried in
-`.context/planning/codec-inventory.md` §2. WAV, the image decoders, and the
+Relocated from fluxor on 2026-07-26.
+Per-area licence provenance: WAV, the image decoders, and the
 Matroska demuxer are original/clean-room; MP3 mirrors CC0 `minimp3`; the
 H.264 decoder is an Apache-2.0 port of h264bsd.
 
 > **Open question — AAC.** `audio/aac/mod.rs` describes itself as a port of
 > **faad2**'s decode path, and faad2 is GPLv2. Five of the six table files
-> are recomputed from their defining formulas by the provenance test and
-> are clean; `hcb.rs` (99 KB of Huffman codebooks — tabulated, not
-> computed) remains unresolved. This gates publication (T2.3.1), not
-> relocation — see inventory §2.1.
+> are recomputed from their defining formulas and are clean; `hcb.rs`
+> (99 KB of Huffman codebooks — tabulated, not computed) remains
+> unresolved. This gates publication, not relocation.

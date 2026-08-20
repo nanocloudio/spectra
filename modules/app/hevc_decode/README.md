@@ -68,7 +68,7 @@ it emits no sustained byte stream.
 ## Verification
 
 Certification is by rig ladder, one rung per capability, each pinned to a
-byte-exact ffmpeg comparison in `tests/hardware/pi5_hevc_*.toml`:
+byte-exact ffmpeg comparison:
 
 | Rung | Proves |
 | --- | --- |

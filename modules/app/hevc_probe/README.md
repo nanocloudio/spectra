@@ -14,7 +14,7 @@ One run answers two questions at once:
    or does the clock still need enabling? — an unclocked block reads as zeroes
    or hangs the access, and both are distinguishable from a live `0x202`.
 
-Answering those *before* adding DMA is the whole point (`standards/rig.md`):
+Answering those *before* adding DMA is the whole point:
 when rung 3 later reports a command list that did not advance, this rung has
 already eliminated "the block was never powered" as the cause.
 
@@ -31,9 +31,8 @@ Observability-exempt: one register read and one log line, no sustained stream.
 
 ## Verification
 
-`tests/hardware/pi5_hevc_probe.toml` (plus a `_diag` variant). Like every rung,
-its pass rule pins the **literal** `BUILD_NONCE` so a stale netboot image cannot
-satisfy it.
+Like every rung of the ladder, the probe's pass rule pins the **literal**
+`BUILD_NONCE` so a stale netboot image cannot satisfy it.
 
 The rung it precedes is `hevc_dma`; the driver that eventually uses what both
 prove is [`hevc_decode`](../hevc_decode/README.md).
