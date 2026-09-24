@@ -1,11 +1,15 @@
-version = "1.0.0"
+version = "2.0.0"
 hardware_targets = ["rp2350", "bcm2712"]
 
-# G.711 µ-law telephony codec — the bidirectional PCM ↔ µ-law bridge for a
-# two-party voice path. Encode averages stereo PCM to mono µ-law for the RTP
-# transmitter; decode expands received µ-law back to stereo PCM for playout.
-# The companding math is `modules/common/g711.rs`, shared verbatim
-# with the host tests; this module is the channel/port wrapper only.
+# G.711 telephony codec — the bidirectional PCM ↔ PCMU/PCMA bridge for a
+# two-party voice path. Encode averages stereo 8 kHz PCM to mono, compands
+# under the `codec` parameter's law (µ-law or A-law), and emits the fluxor
+# encoded-media record stream (`abi::contracts::encoded`): one STREAM naming
+# the law at 8 kHz mono, then one UNIT per `ptime`. Decode expands a PCMU or
+# PCMA record stream (its STREAM says which) back to stereo PCM, emitting
+# silence for samples a DISCONTINUITY says were lost. The companding math is
+# `modules/common/g711.rs`, shared verbatim with the host tests; this module is
+# the stream wrapper only.
 
 [[ports]]
 name = "pcm_in"
@@ -13,23 +17,43 @@ index = 0
 direction = "input"
 content_type = "AudioSample"
 
+# out[0]: at most one STREAM and one 40 ms unit per write.
 [[ports]]
-name = "ulaw_out"
+name = "encoded_out"
 index = 0
 direction = "output"
-content_type = "OctetStream"
+content_type = "AudioEncoded"
+max_record = 350
 
+[ports.facts]
+codec = ["pcmu", "pcma"]
+packing = "raw"
+clock_rate = 8000
+channels = 1
+max_payload = 320
+
+# in[1]: one RTP packet's worth of PCMU per unit, as Wave's `jitter` emits it.
 [[ports]]
-name = "ulaw_in"
+name = "encoded_in"
 index = 1
 direction = "input"
-content_type = "OctetStream"
+content_type = "AudioEncoded"
 
+[ports.facts]
+codec = ["pcmu", "pcma"]
+packing = "raw"
+clock_rate = 8000
+channels = 1
+max_payload = 1460
+
+# out[1]: one decoded unit (1460 µ-law → 5840 bytes of stereo PCM) per write.
 [[ports]]
 name = "pcm_out"
 index = 1
 direction = "output"
 content_type = "AudioSample"
+buffer_size = 16384
+max_record = 5840
 
 [[resources]]
 requires_contract = "channel"

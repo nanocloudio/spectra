@@ -1,4 +1,4 @@
-version = "1.0.0"
+version = "2.0.0"
 hardware_targets = ["rp2350", "bcm2712", "wasm"]
 
 # Feature-set variants (RFC module_variants). Build emits one prebuilt
@@ -13,23 +13,51 @@ hardware_targets = ["rp2350", "bcm2712", "wasm"]
 [[variant]]
 name = "audio"
 features = ["wav", "mp3", "aac"]
-omit_ports = ["pixels"]
+omit_ports = ["pixels", "video_in"]
 
 [[variant]]
 name = "full"
 features = ["wav", "mp3", "aac", "image", "h264"]
 default = true
 
+# Exactly one of the three inputs is wired; `module_new` refuses more.
+#
+# in[0]: a file's bytes — a container or bare essence stream (WAV, MP3, ADTS,
+# BMP/GIF/PNG/JPEG, Matroska), identified by sniffing. The bank writes 1024
+# bytes per tick; sized for a healthy lead so writes don't stall while the
+# image path drains a decoded frame and is not reading.
 [[ports]]
 name = "encoded"
 direction = "input"
 content_type = "OctetStream"
-required = true
-# Input encoded stream — bank writes 1024 bytes per tick; size for a
-# healthy lead so writes don't stall when the BMP path is in
-# Phase::Draining (not reading from in_chan for ~1000 ticks while
-# emitting the decoded frame).
 buffer_size = 65536
+
+# in[1]: an encoded-media record stream (`abi::contracts::encoded`) — AAC (raw
+# with an AudioSpecificConfig, or ADTS) or MP3. The STREAM record names the
+# codec, so nothing is sniffed.
+[[ports]]
+name = "audio_in"
+index = 1
+direction = "input"
+content_type = "AudioEncoded"
+
+[ports.facts]
+codec = ["aac", "mp3"]
+packing = ["raw", "framed"]
+max_payload = 4096
+
+# in[2]: an encoded-media record stream of H.264, Annex B or length-prefixed
+# with its avcC. Not in the `audio` variant.
+[[ports]]
+name = "video_in"
+index = 2
+direction = "input"
+content_type = "VideoEncoded"
+
+[ports.facts]
+codec = "h264"
+packing = ["annexb", "length_prefixed"]
+max_payload = 4096
 
 [[ports]]
 name = "audio"

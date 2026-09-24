@@ -1,29 +1,25 @@
-//! ITU-T G.711 µ-law companding — the narrowband telephony audio core.
+//! ITU-T G.711 companding, µ-law and A-law — the narrowband telephony audio
+//! core.
 //!
 //! Design and rationale mirror the other cores in this crate: pure algorithm,
-//! `no_std`, no I/O, no allocation, no Fluxor ABI. The µ-law codec is a byte
-//! ↔ 14-bit-companded-sample mapping and nothing more — sample rate, channel
-//! layout, packetisation and jitter handling are all caller concerns and stay
-//! in the composing module (Conclave voice / Fluxor VoIP glue), never here.
+//! `no_std`, no I/O, no allocation, no Fluxor ABI. Each law is a byte ↔
+//! companded-sample mapping and nothing more — sample rate, channel layout,
+//! packetisation and jitter handling are all caller concerns and stay in the
+//! composing module (Conclave voice / Fluxor VoIP glue), never here.
 //!
-//! Relocated from `fluxor/modules/app/voip/g711.rs` under Conclave plan S4.2
-//! (`Move G.711 to Spectra`). The decode table is bit-identical to that origin.
-//! The **encoder is corrected here**: the origin computed the segment by
-//! counting bits above bit 7 of the biased magnitude, one segment high across
-//! the whole range, so no codeword survived a decode→encode round trip and the
-//! sign bit collapsed at full scale. This core uses the standard ITU segment
-//! search, which is idempotent against the decode table (`encode(decode(c))`
-//! returns `c` for all 255 non-redundant codewords; `0x7f` and `0xff` both
-//! decode to zero and canonically re-encode to `0xff`). It therefore diverges
-//! from the origin encoder *by design* — the parity relocation (S4.2) proved
-//! the move, and this is the plan's follow-up semantic correction. The vectors
-//! live in `tests/g711_vectors.rs`.
+//! Both encoders are the standard's segment search, which is idempotent
+//! against the decode tables: `encode(decode(c))` returns `c` for every
+//! codeword (µ-law's `0x7f` and `0xff` both decode to zero and canonically
+//! re-encode to `0xff`), and `decode(encode(x))` is monotonic in `x`. The
+//! vectors and those properties are pinned in `tests/g711_vectors.rs`.
 //!
 //! # Boundary
 //!
 //! [`ulaw_encode`] takes one linear 16-bit PCM sample and returns its µ-law
 //! octet; [`ulaw_decode`] inverts it through the standard expansion table.
-//! Both are total functions with no failure mode. Anything that reads a
+//! [`alaw_encode`] / [`alaw_decode`] are the A-law pair (G.711 Tables 1 and
+//! 2: 13-bit magnitude, eight segments, even bits inverted on the wire).
+//! All four are total functions with no failure mode. Anything that reads a
 //! channel, mixes stereo to mono, or paces playout belongs in the module.
 
 /// µ-law bias added to the magnitude before segment extraction (ITU-T G.711).
@@ -86,4 +82,57 @@ pub fn ulaw_encode(sample: i16) -> u8 {
 
     let quant = ((mag >> (segment + 3)) & 0x0F) as u8;
     !(sign | ((segment as u8) << 4) | quant)
+}
+
+/// The wire inversion A-law applies to every octet (ITU-T G.711 §1.2): even
+/// bits toggled, so that a silent line is not an all-zeros pattern.
+const ALAW_MASK: u8 = 0x55;
+
+/// Compand one linear 16-bit PCM sample to its A-law octet (ITU-T G.711
+/// Table 1).
+///
+/// The law is defined on 13-bit linear values, so the sample's low three bits
+/// are dropped first. Segment 0 is linear in the 12-bit magnitude's low bits;
+/// each higher segment covers the next octave and keeps four mantissa bits
+/// below the leading one.
+#[inline]
+#[must_use]
+pub fn alaw_encode(sample: i16) -> u8 {
+    let sign: u8 = if sample >= 0 { 0x80 } else { 0 };
+    let mag13 = if sample >= 0 {
+        (sample as i32) >> 3
+    } else {
+        (-(sample as i32) - 1) >> 3
+    };
+    let mag = mag13.min(0x0FFF) as u32;
+    let (segment, quant) = if mag < 0x20 {
+        (0u8, (mag >> 1) as u8)
+    } else {
+        // Segment s ≥ 1 has its leading one at bit s+4 and its four mantissa
+        // bits at bits s..s+3.
+        let segment = 32 - (mag >> 5).leading_zeros() as u8;
+        (segment, ((mag >> segment) & 0x0F) as u8)
+    };
+    (sign | (segment << 4) | quant) ^ ALAW_MASK
+}
+
+/// Expand one A-law octet to its linear 16-bit PCM sample (ITU-T G.711
+/// Table 2): the decision value of the codeword's interval, scaled to 16 bits.
+#[inline]
+#[must_use]
+pub fn alaw_decode(byte: u8) -> i16 {
+    let code = byte ^ ALAW_MASK;
+    let segment = (code >> 4) & 0x07;
+    let quant = u32::from(code & 0x0F);
+    let mag13 = if segment == 0 {
+        (quant << 1) | 1
+    } else {
+        ((quant << 1) | 0x21) << (segment - 1)
+    };
+    let mag = (mag13 << 3) as i16;
+    if code & 0x80 != 0 {
+        mag
+    } else {
+        -mag
+    }
 }

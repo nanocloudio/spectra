@@ -1712,7 +1712,7 @@ fn mp3d_synth_granule(
 #[repr(C)]
 pub struct Mp3State {
     pub syscalls: *const SyscallTable,
-    pub in_chan: i32,
+    pub input: super::input::Input,
     pub out_chan: i32,
     pending_out: u16,
     pending_offset: u16,
@@ -2766,11 +2766,11 @@ fn decode_scalefactors(
 pub unsafe fn mp3_init(
     s: &mut Mp3State,
     syscalls: *const SyscallTable,
-    in_chan: i32,
+    input: super::input::Input,
     out_chan: i32,
 ) {
     s.syscalls = syscalls;
-    s.in_chan = in_chan;
+    s.input = input;
     s.out_chan = out_chan;
     s.pending_out = 0;
     s.pending_offset = 0;
@@ -2872,7 +2872,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
         return -1;
     }
     let sys = &*s.syscalls;
-    let in_chan = s.in_chan;
+    let input = s.input;
     let out_chan = s.out_chan;
 
     if s.out_pos < s.out_len {
@@ -2893,7 +2893,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
     }
 
     if s.id3_skip > 0 {
-        let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
+        let in_poll = input.poll(sys, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
             return 0;
         }
@@ -2902,7 +2902,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
         } else {
             s.id3_skip as usize
         };
-        let read = (sys.channel_read)(in_chan, s.io_buf.as_mut_ptr(), max_read);
+        let read = input.read(sys, s.io_buf.as_mut_ptr(), max_read);
         if read > 0 {
             s.id3_skip -= read as u32;
         }
@@ -2910,12 +2910,12 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
     }
 
     if s.phase == Mp3Phase::Sync {
-        let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
+        let in_poll = input.poll(sys, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
             return 0;
         }
 
-        let read = (sys.channel_read)(in_chan, s.io_buf.as_mut_ptr(), IO_BUF_SIZE);
+        let read = input.read(sys, s.io_buf.as_mut_ptr(), IO_BUF_SIZE);
         if read <= 0 {
             return 0;
         }
@@ -2972,7 +2972,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
     }
 
     if s.phase == Mp3Phase::Frame {
-        let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
+        let in_poll = input.poll(sys, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
             if s.out_pos >= s.out_len {
                 s.underrun_count += 1;
@@ -2986,7 +2986,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
         } else {
             needed
         };
-        let read = (sys.channel_read)(in_chan, s.io_buf.as_mut_ptr(), max_read);
+        let read = input.read(sys, s.io_buf.as_mut_ptr(), max_read);
         if read <= 0 {
             return 0;
         }

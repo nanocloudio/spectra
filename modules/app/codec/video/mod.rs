@@ -174,6 +174,21 @@ pub struct MkvH264State {
     pub last_err_len: u8,
     _pad3: [u8; 3],
     pub last_err: [u8; 48],
+
+    // ── Record mode ──
+    // Fed from the encoded-media record stream (`video_in`) instead of a
+    // Matroska byte stream: the root calls `es_stream` / `es_unit` / `es_end`
+    // and nothing reads `in_chan`.
+    /// This state is record-fed.
+    records: u8,
+    /// The stream's packing is Annex B: units append verbatim.
+    annexb: u8,
+    /// `END` arrived: the record-mode counterpart of upstream HUP.
+    rec_ended: u8,
+    _pad4: u8,
+    /// `es_len` when the open unit began, so a truncated unit's undecoded
+    /// bytes can be dropped.
+    unit_start: u32,
 }
 
 // ── Allocator adapters (module arena) ─────────────────────────────────────
@@ -196,6 +211,29 @@ pub unsafe fn mkv_init(
     in_chan: i32,
     out_chan: i32,
 ) {
+    if decoder_init(s, syscalls, in_chan, out_chan) {
+        dev_log(&*syscalls, 3, b"[dec] mkv/h264".as_ptr(), 14);
+    }
+}
+
+/// Bind to the pixels port in record mode: no input channel, no demuxer —
+/// the root feeds `es_stream` / `es_unit` / `es_end` from `video_in`.
+pub unsafe fn es_init(s: &mut MkvH264State, syscalls: *const SyscallTable, out_chan: i32) {
+    s.records = 1;
+    // Record `pts` reaches `on_frame_begin` already in milliseconds.
+    s.ts_scale_ns = 1_000_000;
+    if decoder_init(s, syscalls, -1, out_chan) {
+        dev_log(&*syscalls, 3, b"[dec] es/h264".as_ptr(), 13);
+    }
+}
+
+/// Shared by both inputs: stage the channels and bring up the decoder.
+unsafe fn decoder_init(
+    s: &mut MkvH264State,
+    syscalls: *const SyscallTable,
+    in_chan: i32,
+    out_chan: i32,
+) -> bool {
     s.syscalls = syscalls;
     s.in_chan = in_chan;
     s.out_chan = out_chan;
@@ -213,10 +251,89 @@ pub unsafe fn mkv_init(
     if h264_decoder::h264bsdInit(&mut s.storage, 0, alloc) != h264::HANTRO_OK {
         set_err(s, b"[mkv] decoder init failed");
         s.phase = VPhase::Error;
-        return;
+        return false;
     }
     s.dec_ready = 1;
-    dev_log(&*syscalls, 3, b"[dec] mkv/h264".as_ptr(), 14);
+    true
+}
+
+/// Open the record stream: Annex B (parameter sets in band), or
+/// length-prefixed with the width and parameter sets from `avcc`. `false`
+/// when the configuration is unusable.
+pub unsafe fn es_stream(s: &mut MkvH264State, annexb: bool, avcc: &[u8]) -> bool {
+    s.annexb = u8::from(annexb);
+    if annexb {
+        return true;
+    }
+    if adopt_avcc(s, avcc) {
+        return true;
+    }
+    set_err(s, b"[es] bad avcC configuration");
+    s.phase = VPhase::Error;
+    false
+}
+
+/// Whether the accumulator can take `len` more bytes of a unit now, with room
+/// for the start codes and parameter sets appending may add. False is
+/// backpressure: the root keeps the record and offers it again.
+///
+/// Re-framing length prefixes as 4-byte start codes grows a fragment by less
+/// than 2x even for one-byte NALs, and the parameter sets go in once.
+pub unsafe fn es_room(s: &MkvH264State, len: usize) -> bool {
+    let need = 2 * len + 2 * (PS_MAX + START_CODE.len());
+    let free = if s.es.is_null() {
+        s.max_bytes
+    } else {
+        s.es_cap - s.es_len
+    };
+    free as usize >= need
+}
+
+/// One `UNIT` fragment. `first` opens the unit at `pts_ms`; `last` closes it;
+/// `truncated` (on a last fragment) discards what of the unit the decoder has
+/// not consumed, so a damaged picture is concealed rather than decoded whole.
+pub unsafe fn es_unit(
+    s: &mut MkvH264State,
+    first: bool,
+    last: bool,
+    truncated: bool,
+    pts_ms: u64,
+    data: &[u8],
+) {
+    if s.phase == VPhase::Error {
+        return;
+    }
+    let mut sink = EsSink {
+        s: s as *mut MkvH264State,
+    };
+    if first {
+        sink.on_frame_begin(pts_ms as i64, false);
+        s.unit_start = s.es_len;
+    }
+    if truncated {
+        s.es_len = s.unit_start.max(s.es_pos);
+        s.es_complete = s.es_complete.min(s.es_len);
+        s.prefix_have = 0;
+        s.nal_remaining = 0;
+        // The unit's queued PTS names a picture that will not come out.
+        s.pts_count = s.pts_count.saturating_sub(1);
+        return;
+    }
+    if s.annexb != 0 {
+        es_append(s, data);
+        // Annex B NAL ends are only known at the unit's end, so the decoder
+        // sees nothing of a unit until all of it has arrived.
+        if last {
+            s.es_complete = s.es_len;
+        }
+    } else {
+        sink.on_frame_data(data);
+    }
+}
+
+/// `END`: decode what remains, flush the DPB, then finish.
+pub fn es_end(s: &mut MkvH264State) {
+    s.rec_ended = 1;
 }
 
 /// Replay the parent's detect bytes (the EBML magic + following
@@ -254,19 +371,10 @@ impl MkvSink for EsSink {
             s.phase = VPhase::Error;
             return;
         }
-        match parse_avcc(info.codec_private) {
-            Some(avcc) if avcc.sps.len() <= PS_MAX && avcc.pps.len() <= PS_MAX => {
-                s.ts_scale_ns = info.timestamp_scale;
-                s.nal_length_size = avcc.nal_length_size;
-                s.sps[..avcc.sps.len()].copy_from_slice(avcc.sps);
-                s.sps_len = avcc.sps.len() as u8;
-                s.pps[..avcc.pps.len()].copy_from_slice(avcc.pps);
-                s.pps_len = avcc.pps.len() as u8;
-            }
-            _ => {
-                unsafe { set_err(s, b"[mkv] bad avcC codec private") };
-                s.phase = VPhase::Error;
-            }
+        s.ts_scale_ns = info.timestamp_scale;
+        if !adopt_avcc(s, info.codec_private) {
+            unsafe { set_err(s, b"[mkv] bad avcC codec private") };
+            s.phase = VPhase::Error;
         }
     }
 
@@ -382,6 +490,22 @@ impl MkvSink for EsSink {
     }
 }
 
+/// Take the NAL length width and parameter sets from an avcC record. `false`
+/// when it is not one this decoder can use.
+fn adopt_avcc(s: &mut MkvH264State, avcc: &[u8]) -> bool {
+    match parse_avcc(avcc) {
+        Some(a) if a.sps.len() <= PS_MAX && a.pps.len() <= PS_MAX => {
+            s.nal_length_size = a.nal_length_size;
+            s.sps[..a.sps.len()].copy_from_slice(a.sps);
+            s.sps_len = a.sps.len() as u8;
+            s.pps[..a.pps.len()].copy_from_slice(a.pps);
+            s.pps_len = a.pps.len() as u8;
+            true
+        }
+        _ => false,
+    }
+}
+
 unsafe fn feed_demux(s: &mut MkvH264State, data: &[u8]) {
     let mut sink = EsSink {
         s: s as *mut MkvH264State,
@@ -430,6 +554,7 @@ unsafe fn es_compact(s: &mut MkvH264State) {
         s.es_pos = 0;
         s.es_len = 0;
         s.es_complete = 0;
+        s.unit_start = 0;
         return;
     }
     // Only compact from a safe point: h264bsdDecode never needs the
@@ -438,6 +563,7 @@ unsafe fn es_compact(s: &mut MkvH264State) {
     core::ptr::copy(s.es.add(s.es_pos as usize), s.es, remain);
     s.es_len = remain as u32;
     s.es_complete -= s.es_pos;
+    s.unit_start = s.unit_start.saturating_sub(s.es_pos);
     s.es_pos = 0;
 }
 
@@ -513,7 +639,7 @@ pub unsafe fn mkv_step(s: &mut MkvH264State) -> i32 {
 
             // 1) Pull input into the demuxer while there's ES headroom.
             let free = s.es_cap.saturating_sub(s.es_len);
-            if s.es.is_null() || free > ES_HEADROOM {
+            if s.records == 0 && (s.es.is_null() || free > ES_HEADROOM) {
                 let mut chunk = [0u8; IN_CHUNK];
                 let n = ((*s.syscalls).channel_read)(s.in_chan, chunk.as_mut_ptr(), chunk.len());
                 if n > 0 {
@@ -572,9 +698,16 @@ pub unsafe fn mkv_step(s: &mut MkvH264State) -> i32 {
             es_compact(s);
 
             // 3) End of stream: upstream HUP + everything consumed.
-            let poll = ((*s.syscalls).channel_poll)(s.in_chan, super::POLL_IN | super::POLL_HUP);
-            let has_hup = (poll as u32) & super::POLL_HUP != 0;
-            let has_in = (poll as u32) & super::POLL_IN != 0;
+            let (has_hup, has_in) = if s.records != 0 {
+                (s.rec_ended != 0, false)
+            } else {
+                let poll =
+                    ((*s.syscalls).channel_poll)(s.in_chan, super::POLL_IN | super::POLL_HUP);
+                (
+                    (poll as u32) & super::POLL_HUP != 0,
+                    (poll as u32) & super::POLL_IN != 0,
+                )
+            };
             if has_hup && !has_in && s.es_pos >= s.es_complete {
                 s.quiet_ticks = s.quiet_ticks.saturating_add(1);
                 if s.quiet_ticks >= EOF_TICKS {

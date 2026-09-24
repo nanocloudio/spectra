@@ -57,6 +57,16 @@ host_tools_crate = "tests/harness"
 forbid_inline_tests = ["modules"]
 mode                = "strict"
 
+# Crate-root `#![allow(...)]` in `modules/**` is the mounted-source case:
+# each PIC module include!s the fluxor SDK wholesale (every compile sees the
+# full ABI surface and uses a subset), and the DSP/h264 ports keep whole-file
+# allows as deliberate module-shape claims (C names kept verbatim for parity
+# diffing against the reference decoders) — each carries its own reason at
+# the site.
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/"
+reason = """PIC modules mount the fluxor SDK wholesale via include!, so each compile sees the entire surface and uses a subset; the codec ports additionally keep whole-file allows as module-shape claims, with reasons at each site."""
+
 [ci.test]
 # CI phase 3.5 project gates, in order:
 #   1. shadow_guard.sh — shadow-checkout hard-fail:

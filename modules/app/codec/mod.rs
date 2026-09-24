@@ -97,6 +97,7 @@ compile_error!(
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
+use abi::contracts::encoded as enc;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
@@ -135,6 +136,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 #[cfg(any(feature = "image", feature = "h264"))]
 pub mod scale;
 
+// The decoders' byte source: the `encoded` channel, or the record pump's FIFO.
+pub mod input;
+
 #[cfg(any(feature = "wav", feature = "mp3", feature = "aac"))]
 pub mod audio;
 
@@ -166,6 +170,8 @@ const FMT_PNG: u8 = 6;
 const FMT_JPEG: u8 = 7;
 // video (container-carried)
 const FMT_MKV: u8 = 8;
+// video (record-fed: `video_in`)
+const FMT_ES_H264: u8 = 9;
 
 #[inline(always)]
 fn is_audio_format(fmt: u8) -> bool {
@@ -179,7 +185,7 @@ fn is_image_format(fmt: u8) -> bool {
 
 #[inline(always)]
 fn is_video_format(fmt: u8) -> bool {
-    fmt == FMT_MKV
+    fmt == FMT_MKV || fmt == FMT_ES_H264
 }
 
 /// Formats that own their own EOF / drain / reset cycle.
@@ -200,6 +206,21 @@ const DETECT_BUF_SIZE: usize = 16;
 
 /// IO buffer for detection phase reads
 const DETECT_IO_SIZE: usize = 256;
+
+/// Largest `UNIT` fragment payload `audio_in` / `video_in` accept — the
+/// `max_payload` fact on both. A larger access unit arrives as several.
+const REC_FRAGMENT_MAX: usize = 4096;
+/// Carry for the record stream: one whole record at most (a `STREAM`'s
+/// configuration is bounded the same way).
+const REC_CARRY: usize = enc::UNIT_HEADER + REC_FRAGMENT_MAX;
+/// Records handled per step.
+const REC_BUDGET: u32 = 8;
+/// ADTS header the pump writes ahead of each raw AAC unit.
+const ADTS_HEADER: usize = 7;
+/// Largest raw AAC access unit: 6144 bits per channel (ISO 14496-3
+/// §4.5.3.1) for the 7.1 the ADTS channel configuration can name — the most
+/// an ADTS frame can hold is 8191 bytes including its header.
+const AAC_UNIT_MAX: usize = 8191 - ADTS_HEADER;
 
 /// Number of consecutive scheduler ticks with `POLL_IN` clear and
 /// `POLL_HUP` set that the decoder waits before resetting to format-
@@ -339,6 +360,40 @@ struct DecoderState {
     image_scale_mode: u8,
     _image_pad: u8,
     image_max_bytes: u32,
+
+    // ── Record input (`audio_in` / `video_in`) ──
+    //
+    // The encoded-media record stream is a second way in. Its STREAM record
+    // names the codec, so nothing is sniffed: the pump opens the matching
+    // decoder and feeds it — audio through `fifo`, which the decoder reads as
+    // its `Input`, video straight into the H.264 accumulator.
+    /// The wired record input, or -1 when the module reads `encoded`.
+    rec_chan: i32,
+    /// `rec_chan` is `video_in`.
+    rec_video: u8,
+    /// The open stream was accepted and a decoder is bound to it.
+    rec_ok: u8,
+    /// Inside a fragmented unit.
+    rec_in_unit: u8,
+    /// Raw AAC: each unit gets an ADTS header built from the stream's
+    /// AudioSpecificConfig — `adts` is that header's constant part.
+    rec_raw_aac: u8,
+    rec_carry_len: u16,
+    aac_unit_len: u16,
+    /// Video: milliseconds per `pts` tick, Q16 — the PTS pacing clock. A
+    /// division per unit would be a 64-bit one the 32-bit PIC targets
+    /// cannot link, so the ratio is taken once, in 32 bits, per stream.
+    rec_ms_q16: u32,
+    /// Streams refused (no decoder for the codec here) and record-stream
+    /// faults. Counted, never silent.
+    rec_refused: u32,
+    rec_faults: u32,
+    rec_sequence: enc::Sequence,
+    adts: [u8; ADTS_HEADER],
+    _rec_pad: u8,
+    rec_carry: [u8; REC_CARRY],
+    aac_unit: [u8; AAC_UNIT_MAX],
+    fifo: input::ByteFifo,
 }
 
 impl DecoderState {
@@ -517,21 +572,21 @@ unsafe fn init_codec(s: &mut DecoderState) {
         #[cfg(feature = "wav")]
         FMT_WAV => {
             let ws = &mut *(codec_ptr as *mut audio::wav::WavState);
-            audio::wav::wav_init(ws, syscalls, in_chan, out_chan);
+            audio::wav::wav_init(ws, syscalls, input::Input::channel(in_chan), out_chan);
             audio::wav::wav_feed_detect(ws, detect_ptr, detect_len);
             dev_log(&*syscalls, 3, b"[dec] wav".as_ptr(), 9);
         }
         #[cfg(feature = "mp3")]
         FMT_MP3 => {
             let ms = &mut *(codec_ptr as *mut audio::mp3::Mp3State);
-            audio::mp3::mp3_init(ms, syscalls, in_chan, out_chan);
+            audio::mp3::mp3_init(ms, syscalls, input::Input::channel(in_chan), out_chan);
             audio::mp3::mp3_feed_detect(ms, detect_ptr, detect_len);
             dev_log(&*syscalls, 3, b"[dec] mp3".as_ptr(), 9);
         }
         #[cfg(feature = "aac")]
         FMT_AAC => {
             let a = &mut *(codec_ptr as *mut audio::aac::AacState);
-            audio::aac::aac_init(a, syscalls, in_chan, out_chan);
+            audio::aac::aac_init(a, syscalls, input::Input::channel(in_chan), out_chan);
             audio::aac::aac_feed_detect(a, detect_ptr, detect_len);
             dev_log(&*syscalls, 3, b"[dec] aac".as_ptr(), 9);
         }
@@ -573,35 +628,308 @@ unsafe fn init_codec(s: &mut DecoderState) {
         }
         #[cfg(feature = "h264")]
         FMT_MKV => {
-            // Video emits on `pixels` (output port 1), like the image
-            // path. Params are shared with the image path's staging.
             let pix_chan = s.pixels_chan;
-            let (dw, dh, sm, mb) = (
-                s.image_dst_w,
-                s.image_dst_h,
-                s.image_scale_mode,
-                s.image_max_bytes,
-            );
-            warn_unimplemented_scale_mode(&*syscalls, sm);
-            let mkv = &mut *(codec_ptr as *mut video::MkvH264State);
-            mkv.dst_w = dw;
-            mkv.dst_h = dh;
-            mkv.scale_mode = sm;
-            // `max_bytes` is staged from the shared image params whose
-            // DEFAULT (8 MiB) is sized for whole-image accumulation.
-            // Video streams — the ES buffer holds at most a burst of
-            // coded frames (~200 KB each at SD), so treat the image
-            // default as unset and use 2 MiB; explicit smaller/larger
-            // YAML values pass through.
-            mkv.max_bytes = if mb == 0 || mb == 8_388_608 {
-                2 * 1024 * 1024
-            } else {
-                mb
-            };
+            let mkv = stage_video(s);
             video::mkv_init(mkv, syscalls, in_chan, pix_chan);
             video::mkv_feed_detect(mkv, detect_ptr, detect_len);
         }
         _ => {}
+    }
+}
+
+/// Stage the video decoder's parameters in the codec union. Video emits on
+/// `pixels` (output port 1), like the image path, and shares its params.
+#[cfg(feature = "h264")]
+unsafe fn stage_video(s: &mut DecoderState) -> &mut video::MkvH264State {
+    let (dw, dh, sm, mb) = (
+        s.image_dst_w,
+        s.image_dst_h,
+        s.image_scale_mode,
+        s.image_max_bytes,
+    );
+    warn_unimplemented_scale_mode(s.sys(), sm);
+    let mkv = s.mkv();
+    mkv.dst_w = dw;
+    mkv.dst_h = dh;
+    mkv.scale_mode = sm;
+    // `max_bytes` is staged from the shared image params whose DEFAULT
+    // (8 MiB) is sized for whole-image accumulation. The video ES buffer holds
+    // at most a burst of coded frames (~200 KB each at SD), so the image
+    // default reads as unset and becomes 2 MiB; explicit values pass through.
+    mkv.max_bytes = if mb == 0 || mb == 8_388_608 {
+        2 * 1024 * 1024
+    } else {
+        mb
+    };
+    mkv
+}
+
+// ============================================================================
+// Record input
+// ============================================================================
+
+/// The constant part of an ADTS header for a raw AAC stream, from its
+/// AudioSpecificConfig: object type 1–4 (ADTS carries the profile as two
+/// bits), an indexed sample rate, and a channel configuration 1–7. `None`
+/// for anything ADTS cannot express.
+fn adts_template(asc: &[u8]) -> Option<[u8; ADTS_HEADER]> {
+    let (&b0, &b1) = (asc.first()?, asc.get(1)?);
+    let object_type = b0 >> 3;
+    let sfi = ((b0 & 0x07) << 1) | (b1 >> 7);
+    let channels = (b1 >> 3) & 0x0F;
+    if !(1..=4).contains(&object_type) || sfi > 12 || !(1..=7).contains(&channels) {
+        return None;
+    }
+    // MPEG-4, layer 0, no CRC; frame length and fullness filled per unit.
+    Some([
+        0xFF,
+        0xF1,
+        ((object_type - 1) << 6) | (sfi << 2) | (channels >> 2),
+        (channels & 0x03) << 6,
+        0,
+        0x1F,
+        0xFC,
+    ])
+}
+
+/// Forget the record stream after a fault — the boundary is lost, or the
+/// producer broke the record order — and wait for a new one.
+unsafe fn record_fault(s: &mut DecoderState) {
+    s.rec_faults = s.rec_faults.wrapping_add(1);
+    s.rec_carry_len = 0;
+    s.rec_sequence = enc::Sequence::new();
+    close_record_stream(s);
+    let m = b"[dec] record stream fault";
+    dev_log(s.sys(), 2, m.as_ptr(), m.len());
+}
+
+/// Release the decoder bound to the current record stream.
+unsafe fn close_record_stream(s: &mut DecoderState) {
+    s.rec_ok = 0;
+    s.rec_in_unit = 0;
+    s.aac_unit_len = 0;
+    s.fifo.clear();
+    reset_to_detect(s);
+}
+
+/// Bind a decoder to a new record stream, or refuse it.
+unsafe fn open_record_stream(s: &mut DecoderState, st: &enc::Stream<'_>) {
+    close_record_stream(s);
+    let syscalls = s.syscalls;
+    let out_chan = s.out_chan;
+    let fifo = input::Input::fifo(&mut s.fifo);
+    let audio = s.rec_video == 0;
+    s.rec_ok = 1;
+    match (st.codec, st.packing) {
+        #[cfg(feature = "aac")]
+        (enc::CODEC_AAC, enc::PACKING_RAW | enc::PACKING_FRAMED) if audio => {
+            s.rec_raw_aac = u8::from(st.packing == enc::PACKING_RAW);
+            if s.rec_raw_aac != 0 {
+                match adts_template(st.config) {
+                    Some(t) => s.adts = t,
+                    None => s.rec_ok = 0,
+                }
+            }
+            if s.rec_ok != 0 {
+                s.format = FMT_AAC;
+                audio::aac::aac_init(s.aac(), syscalls, fifo, out_chan);
+                dev_log(&*syscalls, 3, b"[dec] es/aac".as_ptr(), 12);
+            }
+        }
+        #[cfg(feature = "mp3")]
+        (enc::CODEC_MP3, enc::PACKING_FRAMED) if audio => {
+            s.format = FMT_MP3;
+            audio::mp3::mp3_init(s.mp3(), syscalls, fifo, out_chan);
+            dev_log(&*syscalls, 3, b"[dec] es/mp3".as_ptr(), 12);
+        }
+        #[cfg(feature = "h264")]
+        (enc::CODEC_H264, enc::PACKING_ANNEXB | enc::PACKING_LENGTH_PREFIXED) if !audio => {
+            s.format = FMT_ES_H264;
+            // `stream_is_valid` refused a zero clock; `NonZeroU32` says so to
+            // the compiler, which then emits no divide-by-zero panic path.
+            s.rec_ms_q16 = core::num::NonZeroU32::new(st.clock_rate)
+                .map_or(0, |clock| (1000u32 << 16) / clock);
+            let pix_chan = s.pixels_chan;
+            let mkv = stage_video(s);
+            video::es_init(mkv, syscalls, pix_chan);
+            if !video::es_stream(mkv, st.packing == enc::PACKING_ANNEXB, st.config) {
+                s.rec_ok = 0;
+            }
+        }
+        _ => s.rec_ok = 0,
+    }
+    if s.rec_ok == 0 {
+        reset_to_detect(s);
+        s.rec_refused = s.rec_refused.wrapping_add(1);
+        let m = b"[dec] record stream refused: no decoder for its codec here";
+        dev_log(&*syscalls, 2, m.as_ptr(), m.len());
+    }
+}
+
+/// Hand one `UNIT` fragment to the bound video decoder. `false` is
+/// backpressure: nothing was taken, and the record is offered again next step.
+#[cfg(feature = "h264")]
+unsafe fn feed_video_unit(s: &mut DecoderState, flags: u8, pts: i64, payload: &[u8]) -> bool {
+    if !video::es_room(s.mkv(), payload.len()) {
+        return false;
+    }
+    let first = s.rec_in_unit == 0;
+    let last = flags & enc::FLAG_CONTINUES == 0;
+    let truncated = flags & enc::FLAG_TRUNCATED != 0;
+    let pts_ms = ((pts.max(0) as u64) * u64::from(s.rec_ms_q16)) >> 16;
+    video::es_unit(s.mkv(), first, last, truncated, pts_ms, payload);
+    s.rec_in_unit = u8::from(!last);
+    true
+}
+
+/// Hand one `UNIT` fragment to the bound audio decoder, through the FIFO.
+/// `false` is backpressure, as for video.
+unsafe fn feed_audio_unit(s: &mut DecoderState, flags: u8, payload: &[u8]) -> bool {
+    let last = flags & enc::FLAG_CONTINUES == 0;
+    let truncated = flags & enc::FLAG_TRUNCATED != 0;
+    if s.rec_raw_aac != 0 {
+        let held = s.aac_unit_len as usize;
+        if last && !truncated && s.fifo.free() < ADTS_HEADER + held + payload.len() {
+            return false;
+        }
+        if held + payload.len() > AAC_UNIT_MAX {
+            // Not an AAC access unit; drop what was gathered of it.
+            s.aac_unit_len = 0;
+            s.rec_in_unit = u8::from(!last);
+            return true;
+        }
+        s.aac_unit[held..held + payload.len()].copy_from_slice(payload);
+        s.aac_unit_len += payload.len() as u16;
+        if last {
+            let len = s.aac_unit_len as usize;
+            s.aac_unit_len = 0;
+            if !truncated {
+                let frame = (ADTS_HEADER + len) as u32;
+                let mut header = s.adts;
+                header[3] |= (frame >> 11) as u8;
+                header[4] = (frame >> 3) as u8;
+                header[5] |= ((frame & 0x07) << 5) as u8;
+                s.fifo.push(&header);
+                s.fifo.push(&s.aac_unit[..len]);
+            }
+        }
+    } else if !truncated && !s.fifo.push(payload) {
+        // Self-delimiting frames (ADTS, MPEG audio) go through as they arrive;
+        // a truncated tail is skipped and the decoder resyncs on the next frame.
+        return false;
+    }
+    s.rec_in_unit = u8::from(!last);
+    true
+}
+
+/// Read the record stream and feed it to the bound decoder.
+unsafe fn pump_records(s: &mut DecoderState) {
+    let len = s.rec_carry_len as usize;
+    if len < REC_CARRY {
+        let n = (s.sys().channel_read)(
+            s.rec_chan,
+            s.rec_carry.as_mut_ptr().add(len),
+            REC_CARRY - len,
+        );
+        if n > 0 {
+            s.rec_carry_len += n as u16;
+        }
+    }
+    let mut budget = REC_BUDGET;
+    while budget > 0 {
+        budget -= 1;
+        let carried = s.rec_carry_len as usize;
+        // Read through a raw view: the handlers below mutate other fields of
+        // `s`, and the carry is not touched until the record is consumed.
+        let carry = core::slice::from_raw_parts(s.rec_carry.as_ptr(), carried);
+        let (record, consumed) = match enc::parse(carry, REC_CARRY) {
+            enc::Parse::NeedMore => return,
+            enc::Parse::Fault(_) => return record_fault(s),
+            enc::Parse::Record { record, consumed } => (record, consumed),
+        };
+        let taken = match record {
+            enc::Record::Unit(u) if s.rec_ok != 0 => {
+                // Admit before feeding, so an out-of-order fragment is never
+                // half-applied; a refused one stays for the next step.
+                let mut probe = s.rec_sequence;
+                if probe.admit(&record).is_err() {
+                    return record_fault(s);
+                }
+                let fed = match s.format {
+                    #[cfg(feature = "h264")]
+                    FMT_ES_H264 => feed_video_unit(s, u.flags, u.pts, u.payload),
+                    _ => feed_audio_unit(s, u.flags, u.payload),
+                };
+                if !fed {
+                    return;
+                }
+                s.rec_sequence = probe;
+                true
+            }
+            _ => {
+                if s.rec_sequence.admit(&record).is_err() {
+                    return record_fault(s);
+                }
+                match record {
+                    enc::Record::Stream(st) => open_record_stream(s, &st),
+                    enc::Record::End => match s.format {
+                        #[cfg(feature = "h264")]
+                        FMT_ES_H264 => video::es_end(s.mkv()),
+                        _ => s.fifo.end(),
+                    },
+                    enc::Record::Unit(_) => {}
+                }
+                true
+            }
+        };
+        if taken {
+            s.rec_carry.copy_within(consumed..carried, 0);
+            s.rec_carry_len = (carried - consumed) as u16;
+        }
+    }
+}
+
+/// One step of a record-fed module: pump records, then run the bound decoder
+/// and release it once its stream has ended and drained.
+unsafe fn step_records(s: &mut DecoderState) -> i32 {
+    pump_records(s);
+    match s.format {
+        #[cfg(feature = "h264")]
+        FMT_ES_H264 => {
+            let r = video::mkv_step(s.mkv());
+            if video::mkv_is_done(s.mkv()) {
+                dev_log(s.sys(), 3, b"[dec] es done".as_ptr(), 13);
+                close_record_stream(s);
+            }
+            r
+        }
+        #[cfg(feature = "mp3")]
+        FMT_MP3 => {
+            let r = audio::mp3::mp3_step(s.mp3());
+            finish_audio_record_stream(s);
+            r
+        }
+        #[cfg(feature = "aac")]
+        FMT_AAC => {
+            let r = audio::aac::aac_step(s.aac());
+            finish_audio_record_stream(s);
+            r
+        }
+        _ => 0,
+    }
+}
+
+/// An audio stream that ended and drained is given the same quiesce window
+/// as a hung-up channel, so the decoder emits the PCM it still holds.
+unsafe fn finish_audio_record_stream(s: &mut DecoderState) {
+    if !s.fifo.ended_and_drained() {
+        s.hup_quiet_ticks = 0;
+        return;
+    }
+    s.hup_quiet_ticks = s.hup_quiet_ticks.saturating_add(1);
+    if s.hup_quiet_ticks >= HUP_QUIESCE_TICKS {
+        dev_log(s.sys(), 3, b"[dec] es done".as_ptr(), 13);
+        close_record_stream(s);
     }
 }
 
@@ -749,6 +1077,23 @@ pub extern "C" fn module_new(
         s.detect_len = 0;
         s.empty_reads = 0;
 
+        // Exactly one way in: `encoded` bytes, or a record stream on
+        // `audio_in` (in[1]) or `video_in` (in[2]).
+        let audio_in = dev_channel_port(&*s.syscalls, 0, 1);
+        let video_in = dev_channel_port(&*s.syscalls, 0, 2);
+        let wired = [in_chan, audio_in, video_in]
+            .iter()
+            .filter(|&&c| c >= 0)
+            .count();
+        if wired > 1 {
+            let m = b"[dec] refusing to construct: wire one of encoded, audio_in, video_in";
+            dev_log(&*s.syscalls, 1, m.as_ptr(), m.len());
+            return -22;
+        }
+        s.rec_chan = if audio_in >= 0 { audio_in } else { video_in };
+        s.rec_video = u8::from(video_in >= 0);
+        s.rec_sequence = enc::Sequence::new();
+
         // Parse params
         let is_tlv =
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
@@ -800,7 +1145,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // wedged hop is identifiable from one log line without
         // instrumenting the peer modules.
         #[cfg(feature = "h264")]
-        if s.tick_count.is_multiple_of(5000) && s.format == FMT_MKV {
+        if s.tick_count.is_multiple_of(5000) && is_video_format(s.format) {
             let mkv = &*(s.codec.0.as_ptr() as *const video::MkvH264State);
             video::mkv_heartbeat(mkv, s.sys());
         }
@@ -820,6 +1165,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if img.last_err_len > 0 {
                 dev_log(s.sys(), 3, img.last_err.as_ptr(), img.last_err_len as usize);
             }
+        }
+
+        if s.rec_chan >= 0 {
+            return step_records(s);
         }
 
         // ----------------------------------------------------------------

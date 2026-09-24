@@ -51,8 +51,9 @@ Fluxor is authoritative for the wire-stable media surfaces, including
 classes and capability vocabulary. Codec identity is deliberately not
 part of that vocabulary: encoded surfaces are generic (`AudioEncoded`
 carries any audio codec's access units, `VideoEncoded` any video
-codec's), and codec identity travels in-band or as a capability fact
-on the wiring edge. [`docs/reference/media-surfaces.md`](reference/media-surfaces.md)
+codec's), and codec identity travels in-band, in the record stream's
+`STREAM` record (`abi::contracts::encoded`), with the codecs a port can
+carry declared as `[ports.facts]`. [`docs/reference/media-surfaces.md`](reference/media-surfaces.md)
 tabulates Spectra's role per surface.
 
 Spectra manifests consume those names without assigning replacement
@@ -68,24 +69,27 @@ activation. They must not add a second runtime or plugin ABI.
 
 Source: `modules/app/codec/mod.rs`, `modules/app/codec/manifest.toml`.
 
-The unified `codec` module reads encoded bytes on one input port and
-decodes them, dispatching on the first bytes of the stream:
+The unified `codec` module has three inputs, of which a graph wires
+exactly one. A file's bytes are sniffed; a record stream names its codec:
 
 ```text
-encoded: OctetStream
-    -> format sniff and bounded dispatch
-    -> WAV / MP3 / AAC-LC          -> audio:  AudioSample
+encoded: OctetStream     (a file: sniffed)
+    -> WAV / MP3 / AAC-LC (ADTS)   -> audio:  AudioSample
     -> BMP / GIF / PNG / JPEG      -> pixels: VideoRaster
     -> Matroska + H.264 CBP        -> pixels: VideoRaster
+audio_in: AudioEncoded   (records: STREAM names the codec)
+    -> AAC (raw + ASC, or ADTS) / MP3 -> audio:  AudioSample
+video_in: VideoEncoded
+    -> H.264 (Annex B, or length-prefixed + avcC) -> pixels: VideoRaster
 ```
 
 It declares two variants: `full` (every family) and `audio` (WAV, MP3,
-AAC only — the `pixels` port is omitted, so wiring it in an image or
-video graph fails at config build, and the module arena drops to
-64 KiB). Declared targets are rp2350, bcm2712, and wasm; each
-declared target is built by `fluxor modules build --all`.
+AAC only — the `pixels` and `video_in` ports are omitted, so wiring
+them in an image or video graph fails at config build, and the module
+arena drops to 64 KiB). Declared targets are rp2350, bcm2712, and wasm;
+each declared target is built by `fluxor modules build --all`.
 
-Alongside it sit `g711` (the PCM ↔ µ-law bridge) and the two BCM2712
+Alongside it sit `g711` (the PCM ↔ G.711 bridge, µ-law or A-law, on the record stream) and the two BCM2712
 HEVC bring-up modules, `hevc_probe` and `hevc_decode`, which drive the
 SoC's hardware decode block directly. The bring-up modules answer
 hardware questions; they are not deployable media decoders.
@@ -129,23 +133,26 @@ source headers:
 | --- | --- |
 | H.264 (Constrained Baseline) | Mechanical Rust port of the h264bsd decoder (Apache-2.0), C names kept verbatim. |
 | MP3 | f32 implementation mirroring minimp3 (CC0). |
-| AAC-LC | f32 port of faad2's decode path — see below. |
+| AAC-LC | Clean-room implementation from a written decoder specification; no decoder source consulted by its author. Tables generated from the specification's formulas and codebook rows by `tools/gen/aac_tables.py`. |
 | WAV, BMP, GIF, PNG, JPEG | Implemented in-tree against the published format specifications; no external decoder lineage. |
 | Matroska demux | Clean-room implementation from RFC 8794 (EBML) and the Matroska specification; no reference code consulted. |
 | G.711 | Companding per ITU-T Recommendation G.711. |
 | BCM2712 HEVC bring-up | In-tree register model and command-list assembler for the SoC's decode block; no third-party code. |
 
-The AAC-LC path needs the explicit statement: it derives from faad2,
-which is dual-licensed GPL-2.0 / commercial, so the repository licence
-alone does not settle its distribution terms. Most of its numeric
-tables are regenerated from published formulas (the KBD window from
-ISO/IEC 13818-7, the inverse-quantisation and trigonometric tables
-from their defining equations) and are therefore not authored
-expression, but the Huffman codebook tables are generated from faad2's
-headers, and the decoder structure follows faad2's. Resolving this —
-by clean-room reimplementation, a licence for the codebooks, or
-shipping AAC as a separately licensed artefact — gates publishing the
-AAC path beyond this repository.
+The AAC-LC decoder is held to a stricter standard than a licence
+header, because every open-source AAC decoder is copyleft or carries
+ISO reference-code terms. It was produced under a two-team clean-room
+protocol: a specification of the decoding process was written and
+reviewed by people who had read existing decoders and the standard,
+and the decoder was written from that specification alone by an author
+who had read neither. The specification, the review record and the
+audit of third-party decoders live in the private planning repository
+(`.context/clean_room/aac/`); the tree carries the outcome — a decoder
+whose every constant cites a section of that specification, tables
+generated from it by `tools/gen/aac_tables.py`, and two proofs:
+`tests/harness/tests/aac_decode.rs` (conformance against ffmpeg) and
+`tests/harness/tests/aac_table_provenance.rs` (every table recomputed
+or re-walked from committed data).
 
 ## Consumers
 

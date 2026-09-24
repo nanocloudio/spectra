@@ -8,7 +8,8 @@ modules into their graphs instead of embedding codec implementations of
 their own.
 
 ```text
-encoded packets or containers (OctetStream)
+files and containers (OctetStream), or
+encoded access units (AudioEncoded / VideoEncoded record streams)
         |
         v
 Spectra demux and decode
@@ -69,8 +70,8 @@ into the store for downstream consumers.
 
 | Module | Targets | What it does |
 | --- | --- | --- |
-| `codec` | rp2350, bcm2712, wasm | Unified decoder: sniffs the input format and decodes WAV, MP3, and AAC-LC audio to `AudioSample`; BMP, GIF, PNG, and JPEG stills to `VideoRaster`; and Matroska-contained H.264 Constrained Baseline video to `VideoRaster`. |
-| `g711` | rp2350, bcm2712 | Bidirectional PCM ↔ µ-law bridge (ITU-T G.711) for a two-party voice path. |
+| `codec` | rp2350, bcm2712, wasm | Unified decoder: sniffs a file and decodes WAV, MP3, and AAC-LC audio to `AudioSample`; BMP, GIF, PNG, and JPEG stills to `VideoRaster`; and Matroska-contained H.264 Constrained Baseline video to `VideoRaster`. Also decodes AAC and MP3 record streams (`audio_in`) and H.264 record streams (`video_in`). |
+| `g711` | rp2350, bcm2712 | Bidirectional PCM ↔ G.711 bridge (µ-law or A-law) for a two-party voice path, on the `AudioEncoded` record stream. |
 | `hevc_probe` | bcm2712 | BCM2712 HEVC block bring-up: reads the hardware version register and exercises a DMA round-trip. |
 | `hevc_decode` | bcm2712 | BCM2712 HEVC phase-1 execution: assembles a command list for an embedded intra slice and drives the entropy engine. |
 
@@ -88,7 +89,7 @@ playback.
 | --- | --- |
 | `modules/app/` | The PIC modules: `codec`, `g711`, `hevc_probe`, `hevc_decode`. `fluxor modules build` packs each into a `.fmod`, plus one per declared variant. |
 | `modules/common/` | Shared format cores, mounted into modules by `#[path]` and published as the `spectra-common` source tree: the Matroska demuxer, the elementary-stream contract, the G.711 companding maths, and the HEVC command-list assembler and register model. |
-| `tools/` | Host tooling: the AAC window-table generator (`tools/gen/`) and the HEVC bitstream and command-list host tools (`tools/hevc/`). |
+| `tools/` | Host tooling: the AAC table generator (`tools/gen/`) and the HEVC bitstream and command-list host tools (`tools/hevc/`). |
 | `docs/` | Reference documentation, indexed by [`docs/overview.md`](docs/overview.md). |
 | `fluxor.toml` | Project manifest for the `fluxor` CLI: identity, dependencies, silicon targets. |
 | `Makefile` | Thin alias layer over the `fluxor` CLI; `make help` lists the targets. |

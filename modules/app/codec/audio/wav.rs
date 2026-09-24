@@ -52,7 +52,7 @@ unsafe fn read_u32_le(ptr: *const u8) -> u32 {
 #[repr(C)]
 pub struct WavState {
     pub syscalls: *const SyscallTable,
-    pub in_chan: i32,
+    pub input: super::input::Input,
     pub out_chan: i32,
     /// Parsing phase
     phase: WavPhase,
@@ -189,11 +189,11 @@ unsafe fn parse_wav_header(s: &mut WavState) -> bool {
 pub unsafe fn wav_init(
     s: &mut WavState,
     syscalls: *const SyscallTable,
-    in_chan: i32,
+    input: super::input::Input,
     out_chan: i32,
 ) {
     s.syscalls = syscalls;
-    s.in_chan = in_chan;
+    s.input = input;
     s.out_chan = out_chan;
     s.phase = WavPhase::ParsingHeader;
     s.channels = 0;
@@ -239,7 +239,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
     }
 
     let sys = &*s.syscalls;
-    let in_chan = s.in_chan;
+    let input = s.input;
     let out_chan = s.out_chan;
 
     if s.phase == WavPhase::Done {
@@ -261,7 +261,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
 
     // State: PARSING_HEADER
     if s.phase == WavPhase::ParsingHeader {
-        let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
+        let in_poll = input.poll(sys, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
             return 0;
         }
@@ -273,8 +273,8 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
             return 0;
         }
 
-        let read = (sys.channel_read)(
-            in_chan,
+        let read = input.read(
+            sys,
             s.header_buf.as_mut_ptr().add(s.header_len as usize),
             space,
         );
@@ -361,7 +361,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
 
     // State: SKIPPING_TO_DATA
     if s.phase == WavPhase::SkippingToData {
-        let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
+        let in_poll = input.poll(sys, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
             return 0;
         }
@@ -378,7 +378,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
             remaining as usize
         };
 
-        let read = (sys.channel_read)(in_chan, s.io_buf.as_mut_ptr(), to_read);
+        let read = input.read(sys, s.io_buf.as_mut_ptr(), to_read);
         if read <= 0 {
             return 0;
         }
@@ -404,7 +404,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
             return 0;
         }
 
-        let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
+        let in_poll = input.poll(sys, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
             return 0;
         }
@@ -426,7 +426,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
             return 0;
         }
 
-        let read = (sys.channel_read)(in_chan, s.io_buf.as_mut_ptr(), to_read);
+        let read = input.read(sys, s.io_buf.as_mut_ptr(), to_read);
         if read <= 0 {
             return 0;
         }

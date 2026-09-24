@@ -35,6 +35,7 @@
 //! visible in one place rather than scattered across the format files.
 
 use super::abi;
+use super::input;
 #[allow(
     unused_imports,
     reason = "the seam re-exports the root surface the whole subtree draws on; which subset is live depends on the enabled format features"
@@ -44,16 +45,16 @@ use super::{
     track_pending, E_AGAIN, IOCTL_NOTIFY, POLL_IN, POLL_OUT,
 };
 
-// `mp3.rs` is an f32 port of CC0 `minimp3`; `aac/` is a port of faad2's decode
-// path. Their value is being diffable against the C original — a reviewer must
-// be able to put the two side by side and see the same constants and the same
-// loop shapes. Restyling them to satisfy these lints would destroy exactly
-// that, for code already proven byte-exact against the reference decoders.
+// `mp3.rs` is an f32 port of CC0 `minimp3`. Its value is being diffable
+// against the C original — a reviewer must be able to put the two side by
+// side and see the same constants and the same loop shapes. Restyling it to
+// satisfy these lints would destroy exactly that, for code already proven
+// byte-exact against the reference decoder.
 //
-// The exemption sits HERE, on the two ports, rather than at the crate root, so
-// the clean-room families (`image/`, `video/`, and this file) stay fully
-// strict. `video/h264/**` is also a port and needs none of it, which is the
-// standard these two are held to as they are revisited.
+// The exemption sits HERE, on the port, rather than at the crate root, so the
+// clean-room families (`aac/`, `image/`, `video/`, and this file) stay fully
+// strict. `aac/` is a clean-room implementation from a specification and
+// needs none of it.
 //
 //   excessive_precision / approx_constant  DSP constants and window tables
 //   identity_op / erasing_op               minimp3 writes strides out in full
@@ -65,22 +66,6 @@ use super::{
 //   manual_range_contains / implicit_saturating_sub /
 //   field_reassign_with_default
 //                                          1:1 with the C control flow
-#[allow(
-    clippy::excessive_precision,
-    clippy::approx_constant,
-    clippy::identity_op,
-    clippy::erasing_op,
-    clippy::needless_range_loop,
-    clippy::too_many_arguments,
-    clippy::manual_memcpy,
-    clippy::assign_op_pattern,
-    clippy::unnecessary_cast,
-    clippy::collapsible_if,
-    clippy::manual_range_contains,
-    clippy::implicit_saturating_sub,
-    clippy::field_reassign_with_default,
-    reason = "inherent to the minimp3 / faad2 ports; see the comment above"
-)]
 #[cfg(feature = "aac")]
 pub mod aac;
 #[allow(
@@ -97,7 +82,7 @@ pub mod aac;
     clippy::manual_range_contains,
     clippy::implicit_saturating_sub,
     clippy::field_reassign_with_default,
-    reason = "see `aac` above"
+    reason = "inherent to the minimp3 port; see the comment above"
 )]
 #[cfg(feature = "mp3")]
 pub mod mp3;

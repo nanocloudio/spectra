@@ -18,10 +18,18 @@ identifiers.
 | `EventTimelineVideo` | Frame-aligned video event timeline | Consume only through a declared adapter |
 
 Encoded surfaces are generic: `AudioEncoded` carries any audio codec's
-access units and `VideoEncoded` any video codec's. Codec identity
-travels in-band (encoded access units and container formats are
-self-describing) or as a capability fact on the wiring edge, never as
-a per-codec content type.
+access units and `VideoEncoded` any video codec's, never a per-codec
+content type. Both carry fluxor's record stream
+(`abi::contracts::encoded`): a `STREAM` record naming codec, packing,
+clock rate, channels and configuration, then `UNIT` fragments, then
+`END`. Spectra's ports declare the codecs they take in `[ports.facts]`
+and check the `STREAM` record on receipt.
+
+| Module | Port | Takes or emits |
+| --- | --- | --- |
+| `codec` | `audio_in` | AAC (raw with an AudioSpecificConfig, or ADTS), MP3 |
+| `codec` | `video_in` | H.264 (Annex B, or length-prefixed with avcC) |
+| `g711` | `encoded_in` / `encoded_out` | PCMU, raw, 8 kHz mono |
 
 `VideoDraw` and `VideoScanout` belong to rendering and presentation
 rather than codecs. Codec modules must not infer dimensions, sample

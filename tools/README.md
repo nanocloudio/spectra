@@ -16,12 +16,16 @@ implementation would defeat the point of deriving it.
 
 ## `gen/`
 
-`aac_kbd_tables.py` regenerates `modules/app/codec/audio/aac/kbd.rs` from the
-ISO 13818-7 KBD window formula. Run with no arguments it only *compares*,
-reporting per-entry ULP differences against what is committed; `--write`
-regenerates. It runs `rustfmt` on its output, because `modules/**` is fmt-checked
-directly and a generator that emits unformatted Rust breaks that check
-for whoever regenerates next rather than for whoever wrote the generator.
+`aac_tables.py` generates `modules/app/codec/audio/aac/tables.rs` — every
+table the AAC-LC decoder uses — from the clean-room decoder specification
+(`.context/clean_room/aac/spec/aac_lc_r01_released.md`): the standard's data
+tables and Huffman codebooks are parsed from it, the KBD windows, cosine,
+inverse-quantisation and power tables are computed from the formulas it
+states. Every run self-checks (Kraft sums, prefix-freeness, band monotonicity,
+the IMDCT decomposition against the direct definition) and writes
+`aac_codebooks.txt`, the committed copy of the codebook rows that
+`tests/harness/tests/aac_table_provenance.rs` checks the tries against, so
+the check needs no access to `.context/`.
 
 The corpus generators are deliberately NOT here — `fixtures/tools/` sits next to
 the media it produces and the digest manifest it invalidates, which is where a
