@@ -7,7 +7,7 @@
 //! that from what is parsed. Every limit checked is one §10 lists.
 
 use super::bits::BitReader;
-use super::tables::{self, Codebook, HCB_SF, HCB_SIGNED, HCB_SPECTRAL, TNS_COEF_3, TNS_COEF_4};
+use super::tables::{self, Codebook, HCB_SIGNED, TNS_COEF_3, TNS_COEF_4};
 use super::Fault;
 
 /// Bands per window: at most 51 long, 15 short [spec r01 §10].
@@ -61,8 +61,8 @@ impl Rate {
         let i = index as usize;
         Some(Self {
             index,
-            long: tables::BANDS_LONG[tables::LONG_TABLE_OF[i] as usize],
-            short: tables::BANDS_SHORT[tables::SHORT_TABLE_OF[i] as usize],
+            long: tables::bands_long(tables::LONG_TABLE_OF[i] as usize),
+            short: tables::bands_short(tables::SHORT_TABLE_OF[i] as usize),
             tns_long: tables::TNS_MAX_BAND_LONG[i],
             tns_short: tables::TNS_MAX_BAND_SHORT[i],
         })
@@ -209,7 +209,8 @@ fn huff(br: &mut BitReader<'_>, book: &Codebook) -> Result<usize, Fault> {
 
 /// One scalefactor-codebook difference, −60..+60 [spec r01 §4.3].
 fn sf_delta(br: &mut BitReader<'_>) -> Result<i16, Fault> {
-    Ok(i16::from(HCB_SF.values[huff(br, &HCB_SF)?]))
+    let book = tables::codebook(0);
+    Ok(i16::from(book.values[huff(br, &book)?]))
 }
 
 /// `window_info()` [spec r01 §4.1].
@@ -429,9 +430,9 @@ fn parse_tns(br: &mut BitReader<'_>, ch: &mut Channel) -> Result<(), Fault> {
 /// Decode the values of one codeword of spectral codebook `cb` into `out`
 /// (quads or pairs), with sign bits and escapes [spec r01 §4.7].
 fn spectral_tuple(br: &mut BitReader<'_>, cb: u8, out: &mut [f32; 4]) -> Result<usize, Fault> {
-    let book = HCB_SPECTRAL[usize::from(cb)];
+    let book = tables::codebook(usize::from(cb));
     let dim = usize::from(book.dim);
-    let row = huff(br, book)?;
+    let row = huff(br, &book)?;
     let values = &book.values[row * dim..row * dim + dim];
     for (o, &v) in out.iter_mut().zip(values) {
         *o = f32::from(v);
