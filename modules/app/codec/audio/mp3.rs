@@ -375,8 +375,9 @@ fn decode_pair_tree(bs: &mut BsCached, tab_num: u8, linbits: u8) -> (i32, i32) {
     }
 }
 
-/// Decode one count1 quad (v, w, x, y) from table A or B.
-fn decode_quad_tree(bs: &mut BsCached, use_table_b: bool) -> (i32, i32, i32, i32) {
+/// Read one count1 codeword from table A or B and return its leaf: bits
+/// 7..4 say which of (v, w, x, y) are non-zero and carry a sign bit.
+fn decode_quad_leaf(bs: &mut BsCached, use_table_b: bool) -> i32 {
     unsafe {
         let codebook: *const u8 = if use_table_b {
             TAB33.as_ptr()
@@ -391,7 +392,14 @@ fn decode_quad_tree(bs: &mut BsCached, use_table_b: bool) -> (i32, i32, i32, i32
             leaf = *codebook.add(idx as usize) as i32;
         }
         bs.flush((leaf & 7) as u32);
+        leaf
+    }
+}
 
+/// The values of a count1 quad whose leaf has been read: a sign bit per
+/// non-zero value.
+fn decode_quad_signs(bs: &mut BsCached, leaf: i32) -> (i32, i32, i32, i32) {
+    {
         let mut v: i32 = 0;
         let mut w: i32 = 0;
         let mut x: i32 = 0;
@@ -565,24 +573,26 @@ fn decode_spectral_data(
             ri += 1;
         }
 
+        // count1 region: quads until the granule's bits run out. The cache
+        // holds `24 - sh` unread bits of the `next - start` bytes loaded, so
+        // the absolute position of the next unread bit is the expression
+        // below. A quad whose codeword ends past `part2_3_length` belongs to
+        // the next granule and is dropped (ISO 11172-3 §2.4.3.4.6); one whose
+        // codeword fits is kept whole, sign bits included.
         let mut pos = big_values_end;
-        let bs_byte_dist = bs.next.offset_from(reader.data.add(byte_off)) as usize;
-        let mut bits_used = (bs_byte_dist * 8) as i32 + bs.sh + 8 + bit_off as i32;
-
         while pos + 3 < 576 {
-            if (start_bit as i32 + bits_used as i32) >= part2_3_end as i32 {
+            let leaf = decode_quad_leaf(&mut bs, count1table_select);
+            let loaded = bs.next.offset_from(reader.data.add(byte_off)) as i32;
+            let bit = byte_off as i32 * 8 + loaded * 8 - 24 + bs.sh;
+            if bit > part2_3_end as i32 {
                 break;
             }
-
-            let (v, w, x, y) = decode_quad_tree(&mut bs, count1table_select);
+            let (v, w, x, y) = decode_quad_signs(&mut bs, leaf);
             *output.add(pos) = v;
             *output.add(pos + 1) = w;
             *output.add(pos + 2) = x;
             *output.add(pos + 3) = y;
             pos += 4;
-
-            let bd2 = bs.next.offset_from(reader.data.add(byte_off)) as usize;
-            bits_used = (bd2 * 8) as i32 + bs.sh + 8 + bit_off as i32;
         }
 
         let consumed_total = part2_3_length as usize;

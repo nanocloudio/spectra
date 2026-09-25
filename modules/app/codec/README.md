@@ -162,3 +162,10 @@ and re-walks every codebook from the generator's committed row file; and
 `tests/harness/tests/aac_decode.rs` holds the decoder within 2 LSB of
 ffmpeg's float decoder on every stream without perceptual noise substitution,
 and to a band-energy envelope on the one with it.
+
+The MP3 decoder covers MPEG-1 Layer III with mid/side stereo; intensity
+stereo is not implemented, and the encoder delay and padding a LAME/Info tag
+declares are not trimmed (the Info frame, the delay and the decoder's own
+529 samples lead the output; the padding trails it).
+`tests/harness/tests/mp3_decode.rs` holds it within 2 LSB of ffmpeg over the
+tag-aligned span.

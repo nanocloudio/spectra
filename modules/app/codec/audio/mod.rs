@@ -48,8 +48,8 @@ use super::{
 // `mp3.rs` is an f32 port of CC0 `minimp3`. Its value is being diffable
 // against the C original — a reviewer must be able to put the two side by
 // side and see the same constants and the same loop shapes. Restyling it to
-// satisfy these lints would destroy exactly that, for code already proven
-// byte-exact against the reference decoder.
+// satisfy these lints would destroy exactly that. Its correctness is held by
+// `tests/harness/tests/mp3_decode.rs` against ffmpeg.
 //
 // The exemption sits HERE, on the port, rather than at the crate root, so the
 // clean-room families (`aac/`, `image/`, `video/`, and this file) stay fully
