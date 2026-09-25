@@ -618,12 +618,12 @@ unsafe fn init_codec(s: &mut DecoderState) {
             };
             image::image_init(img, syscalls, in_chan, pix_chan);
             image::image_feed_detect(img, detect_ptr, detect_len);
-            let tag: &[u8] = match s.format {
-                FMT_GIF => b"[dec] gif",
-                FMT_PNG => b"[dec] png",
-                FMT_JPEG => b"[dec] jpeg",
-                _ => b"[dec] bmp",
-            };
+            let tag = IMAGE_TAGS.get(match s.format {
+                FMT_GIF => 1,
+                FMT_PNG => 2,
+                FMT_JPEG => 3,
+                _ => 0,
+            });
             dev_log(&*syscalls, 3, tag.as_ptr(), tag.len());
         }
         #[cfg(feature = "h264")]
@@ -636,6 +636,11 @@ unsafe fn init_codec(s: &mut DecoderState) {
         _ => {}
     }
 }
+
+// The image family's log tags, one run of bytes rather than a table of
+// pointers a position-independent module cannot hold.
+#[cfg(feature = "image")]
+name_table!(IMAGE_TAGS = [b"[dec] bmp", b"[dec] gif", b"[dec] png", b"[dec] jpeg"]);
 
 /// Stage the video decoder's parameters in the codec union. Video emits on
 /// `pixels` (output port 1), like the image path, and shares its params.

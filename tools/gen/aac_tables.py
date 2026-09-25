@@ -332,18 +332,29 @@ def main():
     o.append("pub static LONG_TABLE_OF: [u8; 13] = [%s];\n" % ", ".join(str(long_order.index(n)) for n in long_names))
     o.append("/// Short-window band table per sampling index (an index into `BANDS_SHORT`). [spec %s T1]\n" % SPEC_REV)
     o.append("pub static SHORT_TABLE_OF: [u8; 13] = [%s];\n\n" % ", ".join(str(short_order.index(n)) for n in short_names))
-    o.append("/// Band start indices for long windows, one table per rate family, each\n"
-             "/// ending with the final boundary 1024; the band count is the length minus one.\n"
-             "/// Order: %s. [spec %s T3]\n" % (", ".join(long_order), SPEC_REV))
-    o.append("pub static BANDS_LONG: [&[u16]; %d] = [\n" % len(long_order))
-    for n in long_order:
-        o.append("    &[%s],\n" % ", ".join(str(v) for v in longs[n]))
-    o.append("];\n")
-    o.append("/// Band start indices for short windows, ending with 128.\n/// Order: %s. [spec %s T4]\n" % (", ".join(short_order), SPEC_REV))
-    o.append("pub static BANDS_SHORT: [&[u16]; %d] = [\n" % len(short_order))
-    for n in short_order:
-        o.append("    &[%s],\n" % ", ".join(str(v) for v in shorts[n]))
-    o.append("];\n\n")
+    # A PIC module is loaded at an arbitrary address with no relocation, so no
+    # static may hold a pointer: every table of slices is emitted as one flat
+    # array plus an integer (start, length) index, and sliced at run time.
+    def flat(name, ty, seqs, per_line, cite, doc, at_doc):
+        data = [v for seq in seqs for v in seq]
+        at = []
+        start = 0
+        for seq in seqs:
+            at.append("[%d, %d]" % (start, len(seq)))
+            start += len(seq)
+        out = rust_array(name + "_DATA", ty, [str(v) for v in data], per_line, cite, doc)
+        out += rust_array(name + "_AT", "[u16; 2]", at, 8, cite, at_doc)
+        return out
+    o.append(flat("BANDS_LONG", "u16", [longs[n] for n in long_order], 16, "[spec %s T3]" % SPEC_REV,
+                  "Band start indices for long windows, every rate family's table in turn, each ending with the final boundary 1024; `bands_long()` cuts one out. Order: %s." % ", ".join(long_order),
+                  "(start, length) of each long-window band table in `BANDS_LONG_DATA`; a table's band count is its length minus one."))
+    o.append(flat("BANDS_SHORT", "u16", [shorts[n] for n in short_order], 16, "[spec %s T4]" % SPEC_REV,
+                  "Band start indices for short windows, every rate family's table in turn, each ending with 128; `bands_short()` cuts one out. Order: %s." % ", ".join(short_order),
+                  "(start, length) of each short-window band table in `BANDS_SHORT_DATA`."))
+    o.append("/// The long-window band table `LONG_TABLE_OF` names for a sampling index. [spec %s T1, T3]\n" % SPEC_REV)
+    o.append("pub fn bands_long(table: usize) -> &'static [u16] {\n    let [start, len] = BANDS_LONG_AT[table];\n    &BANDS_LONG_DATA[usize::from(start)..usize::from(start) + usize::from(len)]\n}\n\n")
+    o.append("/// The short-window band table `SHORT_TABLE_OF` names for a sampling index. [spec %s T1, T4]\n" % SPEC_REV)
+    o.append("pub fn bands_short(table: usize) -> &'static [u16] {\n    let [start, len] = BANDS_SHORT_AT[table];\n    &BANDS_SHORT_DATA[usize::from(start)..usize::from(start) + usize::from(len)]\n}\n\n")
     o.append("/// TNS: highest band (exclusive) a filter may reach, long windows. [spec %s T17]\n" % SPEC_REV)
     o.append("pub static TNS_MAX_BAND_LONG: [u8; 13] = [%s];\n" % ", ".join(str(v) for v in tns_long))
     o.append("/// TNS: highest band (exclusive) a filter may reach, short windows. [spec %s T17]\n" % SPEC_REV)
@@ -356,19 +367,24 @@ def main():
     o.append("/// One Huffman codebook as a binary trie. `nodes[n][bit]` is the next node, or,\n"
              "/// with bit 15 set, a leaf carrying the row index. Every trie is complete\n"
              "/// (Kraft sum 1), so any bit string of sufficient length reaches a leaf.\n"
-             "/// `values` holds `dim` values per row, row-major.\n")
+             "/// `values` holds `dim` values per row, row-major. Built by `codebook()` from\n"
+             "/// the flat tables below; never a static, which could not hold its slices.\n")
     o.append("pub struct Codebook {\n    pub nodes: &'static [[u16; 2]],\n    pub dim: u8,\n    pub values: &'static [i8],\n}\n\n")
+    all_nodes, all_values, at = [], [], []
     for t, dim, rows, trie in books:
-        tag = "SF" if t == 5 else str(t - 5)
-        node_lits = ["[%d, %d]" % (c0, c1) for c0, c1 in trie]
-        o.append(rust_array("HCB_%s_NODES" % tag, "[u16; 2]", node_lits, 6, "[spec %s T%d]" % (SPEC_REV, t),
-                            "Trie of %s (%d rows, %d nodes)." % ("the scalefactor codebook" if t == 5 else "spectral codebook %d" % (t - 5), len(rows), len(trie))))
-        vals = [str(v) for r in rows for v in r[3]]
-        o.append(rust_array("HCB_%s_VALUES" % tag, "i8", vals, 16 if dim == 4 else 16, "[spec %s T%d]" % (SPEC_REV, t),
-                            "Decoded values of %s, %d per row." % ("the scalefactor codebook (index - 60)" if t == 5 else "spectral codebook %d" % (t - 5), dim)))
-        o.append("pub static HCB_%s: Codebook = Codebook { nodes: &HCB_%s_NODES, dim: %d, values: &HCB_%s_VALUES };\n\n" % (tag, tag, dim, tag))
-    o.append("/// Spectral codebooks 1..=11 by number (index 0 is a placeholder: codebook 0 codes nothing). [spec %s §6.1]\n" % SPEC_REV)
-    o.append("pub static HCB_SPECTRAL: [&Codebook; 12] = [&HCB_1, %s];\n" % ", ".join("&HCB_%d" % i for i in range(1, 12)))
+        vals = [v for r in rows for v in r[3]]
+        at.append("[%d, %d, %d, %d, %d]" % (len(all_nodes), len(trie), len(all_values), len(vals), dim))
+        all_nodes += ["[%d, %d]" % (c0, c1) for c0, c1 in trie]
+        all_values += [str(v) for v in vals]
+    o.append(rust_array("HCB_NODES", "[u16; 2]", all_nodes, 6, "[spec %s T5–T16]" % SPEC_REV,
+                        "Tries of the scalefactor codebook (T5) and spectral codebooks 1..=11 (T6–T16), in that order; `HCB_AT` cuts each out."))
+    o.append(rust_array("HCB_VALUES", "i8", all_values, 16, "[spec %s T5–T16]" % SPEC_REV,
+                        "Decoded values of every codebook in the same order, `dim` per row (the scalefactor codebook's are `index - 60`)."))
+    o.append(rust_array("HCB_AT", "[u32; 5]", at, 2, "[spec %s §6.1]" % SPEC_REV,
+                        "(node start, node count, value start, value count, dim) per codebook: 0 the scalefactor codebook, 1..=11 the spectral codebooks by number."))
+    o.append("/// Codebook `book`: 0 the scalefactor codebook, 1..=11 spectral codebook `book`. [spec %s §6.1]\n" % SPEC_REV)
+    o.append("pub fn codebook(book: usize) -> Codebook {\n    let [n0, nn, v0, vn, dim] = HCB_AT[book];\n    Codebook {\n        nodes: &HCB_NODES[n0 as usize..(n0 + nn) as usize],\n        dim: dim as u8,\n        values: &HCB_VALUES[v0 as usize..(v0 + vn) as usize],\n    }\n}\n"
+             "\n")
     o.append("/// Whether spectral codebook `cb` carries signs in its values (else sign bits follow). [spec %s §6.1]\n" % SPEC_REV)
     o.append("pub static HCB_SIGNED: [bool; 12] = [false, true, true, false, false, true, true, false, false, false, false, false];\n\n")
     o.append(rust_array("KBD_LONG", "f32", [f32(v) for v in kbd_long], 6, "[spec %s §8.2]" % SPEC_REV,
