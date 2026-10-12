@@ -70,7 +70,7 @@ into the store for downstream consumers.
 
 | Module | Targets | What it does |
 | --- | --- | --- |
-| `codec` | rp2350, bcm2712, wasm | Unified decoder: sniffs a file and decodes WAV, MP3, and AAC-LC audio to `AudioSample`; BMP, GIF, PNG, and JPEG stills to `VideoRaster`; and Matroska-contained H.264 Constrained Baseline video to `VideoRaster`. Also decodes AAC and MP3 record streams (`audio_in`) and H.264 record streams (`video_in`). |
+| `codec` | rp2350, bcm2712, wasm, linux | Unified decoder: sniffs a file and decodes WAV, MP3, and AAC-LC audio to `AudioSample`; BMP, GIF, PNG, and JPEG stills to `VideoRaster`; and Matroska-contained H.264 Constrained Baseline video to `VideoRaster`. Also decodes AAC and MP3 record streams (`audio_in`) and H.264 record streams (`video_in`). |
 | `g711` | rp2350, bcm2712 | Bidirectional PCM ↔ G.711 bridge (µ-law or A-law) for a two-party voice path, on the `AudioEncoded` record stream. |
 | `hevc_probe` | bcm2712 | BCM2712 HEVC block bring-up: reads the hardware version register and exercises a DMA round-trip. |
 | `hevc_decode` | bcm2712 | BCM2712 HEVC phase-1 execution: assembles a command list for an embedded intra slice and drives the entropy engine. |

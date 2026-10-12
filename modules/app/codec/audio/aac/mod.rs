@@ -129,8 +129,9 @@ struct Decoder {
     noise: Noise,
     ms: MsInfo,
     chans: [Channel; PARSED_CHANNELS],
-    overlap: [[f32; 1024]; MAX_CHANNELS],
-    time: [f32; 1024],
+    /// Overlap tails and the frame's time samples, Q`filterbank::TIME_FRAC`.
+    overlap: [[i32; 1024]; MAX_CHANNELS],
+    time: [i32; 1024],
     scratch: Scratch,
 }
 
@@ -238,7 +239,7 @@ unsafe fn configure(s: &mut AacState, h: &Adts) -> Result<(), Fault> {
     }
     s.dec.rate_index = h.sampling_index;
     s.channel_config = h.channel_config;
-    s.dec.overlap = [[0.0; 1024]; MAX_CHANNELS];
+    s.dec.overlap = [[0; 1024]; MAX_CHANNELS];
     s.dec.prev_shape = [0; MAX_CHANNELS];
     s.refused_logged = 0;
     s.dec.channels = match h.channel_config {
@@ -325,7 +326,7 @@ fn decode_block(d: &mut Decoder, br: &mut BitReader<'_>) -> Result<(), Fault> {
     if !got_audio {
         // No audio element for this layout: silence [spec r01 §3.1].
         for c in out.iter_mut().take(channels) {
-            c.spectrum = [0.0; 1024];
+            c.spectrum = [0; 1024];
             c.tns_count = 0;
         }
     } else if want_pair {
@@ -353,8 +354,14 @@ fn decode_block(d: &mut Decoder, br: &mut BitReader<'_>) -> Result<(), Fault> {
         d.prev_shape[c] = out[c].info.shape;
         for (i, &v) in d.time.iter().enumerate() {
             // Round half away from zero, saturate [spec r01 §9].
-            let r = if v >= 0.0 { v + 0.5 } else { v - 0.5 };
-            let sample = (r as i32).clamp(-32768, 32767) as i16;
+            let half = 1i64 << (filterbank::TIME_FRAC - 1);
+            let v = i64::from(v);
+            let r = if v >= 0 {
+                (v + half) >> filterbank::TIME_FRAC
+            } else {
+                -((half - v) >> filterbank::TIME_FRAC)
+            };
+            let sample = r.clamp(-32768, 32767) as i16;
             let at = (i * channels + c) * 2;
             d.pcm[at..at + 2].copy_from_slice(&sample.to_le_bytes());
         }
@@ -452,7 +459,7 @@ pub unsafe fn aac_step(s: &mut AacState) -> i32 {
             // [spec r01 §2.1, §10]; the overlap is cleared so the next good
             // frame does not add a stale tail [spec r01 §9].
             s.frames_faulted = s.frames_faulted.wrapping_add(1);
-            s.dec.overlap = [[0.0; 1024]; MAX_CHANNELS];
+            s.dec.overlap = [[0; 1024]; MAX_CHANNELS];
             consume(s, 1);
             s.frame_open = 0;
             0

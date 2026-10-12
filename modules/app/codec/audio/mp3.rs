@@ -2,12 +2,13 @@
 //
 // Pipeline (mirrors minimp3.h, lieff/minimp3, CC0):
 //   bitstream → frame buffer → side info → main_data → scalefactors
-//   → huffman → requantize (f32) → MS-stereo → reorder → antialias
+//   → huffman → requantize → MS-stereo → reorder → antialias
 //   → IMDCT (long/short) → change_sign → DCT-II → synthesis → PCM i16
 //
-// DSP layer uses f32 throughout to match minimp3's reference behaviour
-// bit-for-bit (modulo rounding). All targets (rp2350 / bcm2712 / wasm32)
-// have hardware f32 FPU; no soft-float overhead.
+// The DSP layer is fixed point throughout: `i32` samples, `i64` products and
+// accumulators, integer coefficient tables (formats in Section 5). It keeps
+// minimp3's transforms and constants, so every target runs the same integer
+// arithmetic, including cores the kernel gives no FPU.
 
 use super::abi::SyscallTable;
 use super::{
@@ -604,73 +605,160 @@ fn decode_spectral_data(
 }
 
 // ============================================================================
-// Section 5: Requantize tables (float, mirrors minimp3 L3_pow_43 / g_pow43)
+// Section 5: Fixed-point formats, requantize tables (mirrors minimp3
+// L3_pow_43 / g_pow43 / L3_ldexp_q2)
 // ============================================================================
 
-// g_pow43[129+16] from minimp3.h — table holds [-16..-1, 0..128] values of x^(4/3).
-// Indexed as G_POW43[16 + lsb] for lsb in [-16..128].
-static G_POW43: [f32; 145] = [
-    0.0, -1.0, -2.519842, -4.326749, -6.349604, -8.549880, -10.902724, -13.390518, -16.000000,
-    -18.720754, -21.544347, -24.463781, -27.473142, -30.567351, -33.741992, -36.993181, 0.0, 1.0,
-    2.519842, 4.326749, 6.349604, 8.549880, 10.902724, 13.390518, 16.000000, 18.720754, 21.544347,
-    24.463781, 27.473142, 30.567351, 33.741992, 36.993181, 40.317474, 43.711787, 47.173345,
-    50.699631, 54.288352, 57.937408, 61.644865, 65.408941, 69.227979, 73.100443, 77.024898,
-    81.000000, 85.024491, 89.097188, 93.216975, 97.382800, 101.593667, 105.848633, 110.146801,
-    114.487321, 118.869381, 123.292209, 127.755065, 132.257246, 136.798076, 141.376907, 145.993119,
-    150.646117, 155.335327, 160.060199, 164.820202, 169.614826, 174.443577, 179.305980, 184.201575,
-    189.129918, 194.090580, 199.083145, 204.107210, 209.162385, 214.248292, 219.364564, 224.510845,
-    229.686789, 234.892058, 240.126328, 245.389280, 250.680604, 256.000000, 261.347174, 266.721841,
-    272.123723, 277.552547, 283.008049, 288.489971, 293.998060, 299.532071, 305.091761, 310.676898,
-    316.287249, 321.922592, 327.582707, 333.267377, 338.976394, 344.709550, 350.466646, 356.247482,
-    362.051866, 367.879608, 373.730522, 379.604427, 385.501143, 391.420496, 397.362314, 403.326427,
-    409.312672, 415.320884, 421.350905, 427.402579, 433.475750, 439.570269, 445.685987, 451.822757,
-    457.980436, 464.158883, 470.357960, 476.577530, 482.817459, 489.077615, 495.357868, 501.658090,
-    507.978156, 514.317941, 520.677324, 527.056184, 533.454404, 539.871867, 546.308458, 552.764065,
-    559.238575, 565.731879, 572.243870, 578.774440, 585.323483, 591.890898, 598.476581, 605.080431,
-    611.702349, 618.342238, 625.000000, 631.675540, 638.368763, 645.079578,
+// Sample format. Every spectral line, subband sample and synthesis history
+// value is an `i32` holding the decoder's working amplitude × 2^FRAC_BITS.
+// The working amplitude is minimp3's: half the ISO 11172-3 amplitude (the
+// dequantiser gain carries the 1/2), so a full-scale tone peaks near 0.55 and
+// the synthesis window, which is the ISO window × 2^16, lands directly in
+// PCM units. One output LSB is therefore 2^FRAC_BITS in the synthesis
+// accumulator, and rounding a sample to 2^-FRAC_BITS moves the output by at
+// most about a hundredth of an LSB. At 23 bits the worst sample differs from
+// ffmpeg's float decoder by 1 LSB; two fewer bits make it 2, and more buy
+// nothing and cost headroom.
+const FRAC_BITS: u32 = 23;
+
+// Bounds that keep every stage inside `i32` whatever the bitstream says.
+//
+// LINE_MAX caps a requantised line. MS stereo (×2), the antialias butterflies
+// (×√2) and the IMDCT with the overlap its previous granule carries in grow a
+// line by at most 2 × √2 × 16.2 < 46× — 16.2 is the long and stop windows'
+// exact worst case over every intermediate and output, short blocks 5.4 — so
+// 46 × 2^25 < 2^31. 2^25 is 4.0 in the working amplitude, about 7× the
+// loudest line a full-scale stream produces.
+const LINE_MAX: i32 = 1 << 25;
+// SUBBAND_MAX caps a subband sample entering the polyphase DCT-II, whose
+// intermediates reach at most 76× its largest input (exactly 75.99; 32× at
+// the outputs), so 76 × 2^24 < 2^31. 2^24 is 2.0 in the working amplitude: a subband sample
+// that large already drives the output several times past full scale.
+const SUBBAND_MAX: i32 = 1 << 24;
+
+/// `x × c` for a coefficient `c` in Q30, rounded to nearest.
+#[inline(always)]
+fn mul_q30(x: i32, c: i32) -> i32 {
+    ((x as i64 * c as i64 + (1 << 29)) >> 30) as i32
+}
+
+/// `x × c` for a coefficient `c` in Q29, rounded to nearest.
+#[inline(always)]
+fn mul_q29(x: i32, c: i32) -> i32 {
+    ((x as i64 * c as i64 + (1 << 28)) >> 29) as i32
+}
+
+/// `x × c` for a coefficient `c` in Q27, rounded to nearest.
+#[inline(always)]
+fn mul_q27(x: i32, c: i32) -> i32 {
+    ((x as i64 * c as i64 + (1 << 26)) >> 27) as i32
+}
+
+/// A sum of products of samples and Q30 coefficients, back to a sample,
+/// rounded to nearest.
+#[inline(always)]
+fn round_q30(acc: i64) -> i32 {
+    ((acc + (1 << 29)) >> 30) as i32
+}
+
+/// `x / 2`, rounded to nearest.
+#[inline(always)]
+fn half(x: i32) -> i32 {
+    (x + 1) >> 1
+}
+
+// g_pow43 from minimp3.h, non-negative half: `G_POW43[x]` = round(x^(4/3) ×
+// 2^22) for x in 0..=128. 128^(4/3) × 2^22 still fits a `u32`.
+static G_POW43: [u32; 129] = [
+    0, 4194304, 10568984, 18147699, 26632170, 35860795, 45729337, 56163904, 67108864, 78520535,
+    90363540, 102608534, 115230709, 128208762, 141524171, 155160648, 169103741, 183340523,
+    197859350, 212649666, 227701853, 243007101, 258557305, 274344981, 290363191, 306605482,
+    323065837, 339738624, 356618564, 373700692, 390980332, 408453069, 426114725, 443961344,
+    461989169, 480194628, 498574320, 517125003, 535843582, 554727097, 573772716, 592977726,
+    612339523, 631855609, 651523582, 671341132, 691306033, 711416142, 731669392, 752063788,
+    772597403, 793268373, 814074897, 835015231, 856087688, 877290629, 898622470, 920081670,
+    941666736, 963376216, 985208700, 1007162819, 1029237238, 1051430660, 1073741824, 1096169499,
+    1118712486, 1141369619, 1164139758, 1187021793, 1210014639, 1233117240, 1256328562, 1279647595,
+    1303073354, 1326604876, 1350241217, 1373981457, 1397824693, 1421770044, 1445816646, 1469963653,
+    1494210238, 1518555589, 1542998910, 1567539424, 1592176366, 1616908986, 1641736552, 1666658341,
+    1691673647, 1716781775, 1741982045, 1767273788, 1792656346, 1818129074, 1843691338, 1869342516,
+    1895081995, 1920909174, 1946823461, 1972824274, 1998911042, 2025083200, 2051340197, 2077681487,
+    2104106534, 2130614810, 2157205797, 2183878982, 2210633862, 2237469942, 2264386732, 2291383752,
+    2318460528, 2345616592, 2372851485, 2400164752, 2427555947, 2455024628, 2482570360, 2510192716,
+    2537891272, 2565665611, 2593515323, 2621440000, 2649439243, 2677512657, 2705659852,
 ];
 
-/// L3_pow_43 from minimp3.h, ported verbatim. Returns x^(4/3) for non-negative x.
+// Coefficients of minimp3's second-order expansion (1 + f)^(4/3) ≈
+// 1 + f × (4/3 + f × 2/9), in Q30: round(4/3 × 2^30), round(2/9 × 2^30).
+const POW43_C1: i64 = 1431655765;
+const POW43_C2: i64 = 238609294;
+
+/// L3_pow_43 from minimp3.h. Returns x^(4/3) for 0 <= x <= 8206 as
+/// `(mantissa, shift)`, the value being `mantissa × 2^shift` with the
+/// mantissa in Q22. Below 129 it is the table; above, the table entry for the
+/// nearest multiple of 64 refined by the expansion.
 #[inline]
-fn l3_pow_43(x: i32) -> f32 {
+fn l3_pow_43(x: i32) -> (u32, u32) {
     if x < 129 {
-        return unsafe { *G_POW43.as_ptr().add((16 + x) as usize) };
+        return (unsafe { *G_POW43.as_ptr().add(x as usize) }, 0);
     }
-    let mut mult: f32 = 256.0;
+    let mut shift: u32 = 8;
     let mut xv = x;
     if xv < 1024 {
-        mult = 16.0;
+        shift = 4;
         xv <<= 3;
     }
     // sign tracks the rounding direction for the lookup index
-    let sign = (2i32.wrapping_mul(xv) & 64) as i32;
+    let sign = 2i32.wrapping_mul(xv) & 64;
     let num = (xv & 63) - sign;
     let den = (xv & !63) + sign;
-    let frac = (num as f32) / (den as f32);
-    let idx = (16 + ((xv + sign) >> 6)) as usize;
-    let lookup = unsafe { *G_POW43.as_ptr().add(idx) };
-    lookup * (1.0 + frac * ((4.0 / 3.0) + frac * (2.0 / 9.0))) * mult
+    // frac = num / den, |frac| <= 1/32, in Q25 (num << 25 stays below 2^30).
+    let frac = ((num << 25) / den) as i64;
+    let inner = POW43_C1 + ((frac * POW43_C2) >> 25);
+    let poly = (1i64 << 30) + ((frac * inner) >> 25);
+    let lookup = unsafe { *G_POW43.as_ptr().add(((xv + sign) >> 6) as usize) };
+    (
+        ((lookup as u64 * poly as u64 + (1 << 29)) >> 30) as u32,
+        shift,
+    )
 }
 
-/// L3_ldexp_q2: y * 2^(exp_q2 / 4) using float arithmetic, no float pow().
-/// Mirrors minimp3's L3_ldexp_q2.
-fn l3_ldexp_q2(mut y: f32, mut exp_q2: i32) -> f32 {
-    const G_EXPFRAC: [f32; 4] = [
-        9.31322575e-10,
-        7.83145814e-10,
-        6.58544508e-10,
-        5.53767716e-10,
-    ];
-    loop {
-        let e = if exp_q2 > 30 * 4 { 30 * 4 } else { exp_q2 };
-        let pow_part = (1u32 << 30) >> ((e >> 2) as u32);
-        y *= unsafe { *G_EXPFRAC.as_ptr().add((e & 3) as usize) } * pow_part as f32;
-        exp_q2 -= e;
-        if exp_q2 <= 0 {
-            break;
-        }
+// L3_ldexp_q2's fractional quarter-steps: `G_EXPFRAC[r]` = round(2^(-r/4) ×
+// 2^31), held as `u32` so that r = 0 (exactly 2^31) fits.
+static G_EXPFRAC: [u32; 4] = [2147483648, 1805811301, 1518500250, 1276901417];
+
+/// L3_ldexp_q2 applied to one line's magnitude: `pow43 × 2^(-exp_q2 / 4)` in
+/// the sample format, rounded to nearest and saturated at `LINE_MAX`.
+/// `exp_q2` already includes the granule gain, so it may be negative (a gain
+/// above unity); the global gain bounds it below by -41.
+#[inline]
+fn l3_ldexp_q2(pow43: (u32, u32), exp_q2: i32) -> i32 {
+    let (m, m_shift) = pow43;
+    let frac = unsafe { *G_EXPFRAC.as_ptr().add((exp_q2 & 3) as usize) };
+    // m (Q22) × frac (Q31) is Q53. Whole quarter-steps fold into the shift,
+    // which stays >= 53 - 23 - 8 - 11 = 11 for every legal exp_q2.
+    let sh = 53 - FRAC_BITS as i32 - m_shift as i32 + (exp_q2 >> 2);
+    if sh >= 64 {
+        return 0;
     }
-    y
+    let v = (m as u64 * frac as u64 + (1u64 << (sh - 1))) >> sh;
+    if v > LINE_MAX as u64 {
+        LINE_MAX
+    } else {
+        v as i32
+    }
+}
+
+/// One requantised line: sign(q) × |q|^(4/3) × 2^(-exp_q2 / 4).
+#[inline]
+fn l3_requant_line(q: i32, exp_q2: i32) -> i32 {
+    if q == 0 {
+        0
+    } else if q > 0 {
+        l3_ldexp_q2(l3_pow_43(q), exp_q2)
+    } else {
+        -l3_ldexp_q2(l3_pow_43(-q), exp_q2)
+    }
 }
 
 // ============================================================================
@@ -731,17 +819,17 @@ fn long_sfb_widths(sample_rate: u32, out: &mut [u8; 22]) {
 }
 
 // ============================================================================
-// Section 7: Requantize (f32 output, per-band gain * pow_4_3)
+// Section 7: Requantize (per-band gain * pow_4_3, in the sample format)
 //
 // Mirrors minimp3 L3_decode_scalefactors gain-exp arithmetic, applied to our
 // existing scalefactor decode (`Mp3State::scalefactors`). The output `freq` is
-// signed float; sign comes from the integer quanta sign.
+// signed fixed point; sign comes from the integer quanta sign.
 // ============================================================================
 
 /// Apply requantization to the 576 spectral samples of one granule/channel.
 ///
 /// - `is`: signed integer quanta from huffman (size 576)
-/// - `freq`: output f32 spectral samples (size 576)
+/// - `freq`: output spectral samples in the sample format (size 576)
 /// - `scf`: 39 scalefactor bytes for this granule/channel (already includes the
 ///   raw `iscf` values from the bitstream; preflag/pretab and subblock_gain are
 ///   added here)
@@ -752,7 +840,7 @@ fn long_sfb_widths(sample_rate: u32, out: &mut [u8; 22]) {
 /// - `sample_rate`, `ms_stereo`: needed for gain adjustment
 fn requantize(
     is: *const i32,
-    freq: *mut f32,
+    freq: *mut i32,
     scf: *const u8,
     global_gain: u8,
     scalefac_scale: bool,
@@ -767,12 +855,10 @@ fn requantize(
         // gain_exp = global_gain + BITS_DEQUANTIZER_OUT*4 - 210 - (MS?2:0)
         //          = global_gain - 4 - 210 - (MS?2:0)
         // BITS_DEQUANTIZER_OUT = -1 in minimp3 → factor of 1/2 in output domain.
+        // A line is pow43(|is|) × 2^(gain_exp / 4) × 2^(-band_exp_q2 / 4), so
+        // each band hands l3_ldexp_q2 the single exponent band_exp_q2 - gain_exp.
         let ms_adj: i32 = if ms_stereo { 2 } else { 0 };
         let gain_exp = global_gain as i32 - 4 - 210 - ms_adj;
-        // MAX_SCF = 255 + BITS_DEQUANTIZER_OUT*4 - 210 = 41
-        // MAX_SCFI = (MAX_SCF + 3) & ~3 = 44 (rounded UP to multiple of 4)
-        // gain = ldexp_q2(1 << (MAX_SCFI/4), MAX_SCFI - gain_exp) = ldexp_q2(2^11, 44 - gain_exp)
-        let gain_base = l3_ldexp_q2((1u32 << 11) as f32, 44 - gain_exp);
 
         let scf_shift = if scalefac_scale { 2u32 } else { 1u32 };
 
@@ -798,18 +884,10 @@ fn requantize(
                     };
                     // subblock_gain folded via *8 in the exponent.
                     let sbg = *subblock_gain.add(win) as i32 * 8;
-                    let exp_q2 = ((sf_val as i32) << scf_shift) + sbg;
-                    let band_gain = l3_ldexp_q2(gain_base, exp_q2);
+                    let exp_q2 = ((sf_val as i32) << scf_shift) + sbg - gain_exp;
                     let mut k: usize = 0;
                     while k < w {
-                        let q = *is.add(pos + k);
-                        if q == 0 {
-                            *freq.add(pos + k) = 0.0;
-                        } else if q > 0 {
-                            *freq.add(pos + k) = band_gain * l3_pow_43(q);
-                        } else {
-                            *freq.add(pos + k) = -band_gain * l3_pow_43(-q);
-                        }
+                        *freq.add(pos + k) = l3_requant_line(*is.add(pos + k), exp_q2);
                         k += 1;
                     }
                     pos += w;
@@ -818,7 +896,7 @@ fn requantize(
                 sfb += 1;
             }
             while pos < GRANULE_SAMPLES {
-                *freq.add(pos) = 0.0;
+                *freq.add(pos) = 0;
                 pos += 1;
             }
         } else if block_type == 2 && mixed {
@@ -855,18 +933,10 @@ fn requantize(
                 let w = b - a;
                 let sf_val: i32 = if sfb < 39 { *scf.add(sfb) as i32 } else { 0 };
                 // Note: mixed blocks do NOT use preflag (only pure long blocks do).
-                let exp_q2 = (sf_val as i32) << scf_shift;
-                let band_gain = l3_ldexp_q2(gain_base, exp_q2);
+                let exp_q2 = ((sf_val as i32) << scf_shift) - gain_exp;
                 let mut k: usize = 0;
                 while k < w {
-                    let q = *is.add(pos + k);
-                    if q == 0 {
-                        *freq.add(pos + k) = 0.0;
-                    } else if q > 0 {
-                        *freq.add(pos + k) = band_gain * l3_pow_43(q);
-                    } else {
-                        *freq.add(pos + k) = -band_gain * l3_pow_43(-q);
-                    }
+                    *freq.add(pos + k) = l3_requant_line(*is.add(pos + k), exp_q2);
                     k += 1;
                 }
                 pos += w;
@@ -907,21 +977,13 @@ fn requantize(
                         0
                     };
                     let sbg = *subblock_gain.add(win) as i32 * 8;
-                    let exp_q2 = ((sf_val as i32) << scf_shift) + sbg;
-                    let band_gain = l3_ldexp_q2(gain_base, exp_q2);
+                    let exp_q2 = ((sf_val as i32) << scf_shift) + sbg - gain_exp;
                     let mut k: usize = 0;
                     while k < w {
                         if pos + k >= GRANULE_SAMPLES {
                             break;
                         }
-                        let q = *is.add(pos + k);
-                        if q == 0 {
-                            *freq.add(pos + k) = 0.0;
-                        } else if q > 0 {
-                            *freq.add(pos + k) = band_gain * l3_pow_43(q);
-                        } else {
-                            *freq.add(pos + k) = -band_gain * l3_pow_43(-q);
-                        }
+                        *freq.add(pos + k) = l3_requant_line(*is.add(pos + k), exp_q2);
                         k += 1;
                     }
                     pos += w;
@@ -931,7 +993,7 @@ fn requantize(
                 sfb_short += 1;
             }
             while pos < GRANULE_SAMPLES {
-                *freq.add(pos) = 0.0;
+                *freq.add(pos) = 0;
                 pos += 1;
             }
         } else {
@@ -949,28 +1011,20 @@ fn requantize(
                 } else {
                     sf_val
                 };
-                let exp_q2 = (sf_eff as i32) << scf_shift;
-                let band_gain = l3_ldexp_q2(gain_base, exp_q2);
+                let exp_q2 = ((sf_eff as i32) << scf_shift) - gain_exp;
                 let mut k: usize = 0;
                 while k < w {
                     if pos + k >= GRANULE_SAMPLES {
                         break;
                     }
-                    let q = *is.add(pos + k);
-                    if q == 0 {
-                        *freq.add(pos + k) = 0.0;
-                    } else if q > 0 {
-                        *freq.add(pos + k) = band_gain * l3_pow_43(q);
-                    } else {
-                        *freq.add(pos + k) = -band_gain * l3_pow_43(-q);
-                    }
+                    *freq.add(pos + k) = l3_requant_line(*is.add(pos + k), exp_q2);
                     k += 1;
                 }
                 pos += w;
                 sfb += 1;
             }
             while pos < GRANULE_SAMPLES {
-                *freq.add(pos) = 0.0;
+                *freq.add(pos) = 0;
                 pos += 1;
             }
         }
@@ -981,7 +1035,7 @@ fn requantize(
 // Section 8: MS stereo (just add/subtract; the 1/sqrt(2) is in the gain_exp)
 // ============================================================================
 
-fn process_ms_stereo(freq_lines: *mut f32) {
+fn process_ms_stereo(freq_lines: *mut i32) {
     unsafe {
         let right = freq_lines.add(GRANULE_SAMPLES);
         let mut i: usize = 0;
@@ -1000,10 +1054,10 @@ fn process_ms_stereo(freq_lines: *mut f32) {
 // ============================================================================
 
 /// Reorder short-block spectral values from SFB-sequential to window-interleaved.
-/// Uses `scratch` as temporary (must be ≥ 540 f32 / 576 to be safe).
+/// Uses `scratch` as temporary (must be ≥ 540 samples / 576 to be safe).
 fn reorder_short(
-    grbuf: *mut f32,
-    scratch: *mut f32,
+    grbuf: *mut i32,
+    scratch: *mut i32,
     sfb_widths: *const u8,
     nbands_to_reorder: usize,
 ) {
@@ -1043,15 +1097,18 @@ fn reorder_short(
 // Section 10: Antialiasing butterflies (ISO 11172-3 §2.4.3.4)
 // ============================================================================
 
-// minimp3 g_aa[0] = cs (positive cosine coefs), g_aa[1] = ca (positive sine).
-static AA_CS: [f32; 8] = [
-    0.85749293, 0.88174200, 0.94962865, 0.98331459, 0.99551782, 0.99916056, 0.99989920, 0.99999316,
+// minimp3 g_aa[0] = cs, g_aa[1] = ca, from the ISO coefficients
+// c[i] = {-0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037}:
+// AA_CS[i] = round(1 / sqrt(1 + c[i]^2) × 2^30),
+// AA_CA[i] = round(|c[i]| / sqrt(1 + c[i]^2) × 2^30).
+static AA_CS: [i32; 8] = [
+    920726018, 946763260, 1019655998, 1055826004, 1068929116, 1072840480, 1073633586, 1073734474,
 ];
-static AA_CA: [f32; 8] = [
-    0.51449576, 0.47173197, 0.31337745, 0.18191320, 0.09457419, 0.04096558, 0.01419856, 0.00369997,
+static AA_CA: [i32; 8] = [
+    552435611, 506518344, 336486479, 195327811, 101548266, 43986460, 15245597, 3972818,
 ];
 
-fn antialias_butterflies(freq: *mut f32, nbands: usize) {
+fn antialias_butterflies(freq: *mut i32, nbands: usize) {
     // nbands = number of butterfly pairs to perform.
     // Pair n acts on subband seam between subband n and n+1 (lines 17±i, 18+i).
     unsafe {
@@ -1065,12 +1122,12 @@ fn antialias_butterflies(freq: *mut f32, nbands: usize) {
                 if lower_idx >= GRANULE_SAMPLES {
                     break;
                 }
-                let u = *freq.add(lower_idx);
-                let d = *freq.add(upper_idx);
-                let cs = *AA_CS.as_ptr().add(i);
-                let ca = *AA_CA.as_ptr().add(i);
-                *freq.add(lower_idx) = u * cs - d * ca;
-                *freq.add(upper_idx) = u * ca + d * cs;
+                let u = *freq.add(lower_idx) as i64;
+                let d = *freq.add(upper_idx) as i64;
+                let cs = *AA_CS.as_ptr().add(i) as i64;
+                let ca = *AA_CA.as_ptr().add(i) as i64;
+                *freq.add(lower_idx) = round_q30(u * cs - d * ca);
+                *freq.add(upper_idx) = round_q30(u * ca + d * cs);
                 i += 1;
             }
             sb += 1;
@@ -1082,29 +1139,43 @@ fn antialias_butterflies(freq: *mut f32, nbands: usize) {
 // Section 11: IMDCT (long-36 and short-12)
 // ============================================================================
 
-// minimp3 g_twid9
-static G_TWID9: [f32; 18] = [
-    0.73727734, 0.79335334, 0.84339145, 0.88701083, 0.92387953, 0.95371695, 0.97629601, 0.99144486,
-    0.99904822, 0.67559021, 0.60876143, 0.53729961, 0.46174861, 0.38268343, 0.30070580, 0.21643961,
-    0.13052619, 0.04361938,
+// minimp3 g_twid9: G_TWID9[i] = round(cos((17 - 2i)π/72) × 2^30) and
+// G_TWID9[9 + i] = round(sin((17 - 2i)π/72) × 2^30), i in 0..9.
+static G_TWID9: [i32; 18] = [
+    791645512, 851856663, 905584669, 952420630, 992008094, 1024045778, 1048289855, 1064555814,
+    1072719860, 725409462, 653652607, 576921062, 495798798, 410903207, 322880394, 232400266,
+    140151432, 46835961,
 ];
 
-// minimp3 g_mdct_window[0] = long block window
-static MDCT_WIN_LONG: [f32; 18] = [
-    0.99904822, 0.99144486, 0.97629601, 0.95371695, 0.92387953, 0.88701083, 0.84339145, 0.79335334,
-    0.73727734, 0.04361938, 0.13052619, 0.21643961, 0.30070580, 0.38268343, 0.46174861, 0.53729961,
-    0.60876143, 0.67559021,
+// minimp3 g_mdct_window[0] = long block window: MDCT_WIN_LONG[i] =
+// round(cos((2i + 1)π/72) × 2^30) and MDCT_WIN_LONG[9 + i] =
+// round(sin((2i + 1)π/72) × 2^30), i in 0..9.
+static MDCT_WIN_LONG: [i32; 18] = [
+    1072719860, 1064555814, 1048289855, 1024045778, 992008094, 952420630, 905584669, 851856663,
+    791645512, 46835961, 140151432, 232400266, 322880394, 410903207, 495798798, 576921062,
+    653652607, 725409462,
 ];
 
-// minimp3 g_mdct_window[1] = stop block window (block_type == 3)
-static MDCT_WIN_STOP: [f32; 18] = [
-    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.99144486, 0.92387953, 0.79335334, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    0.13052619, 0.38268343, 0.60876143,
+// minimp3 g_mdct_window[1] = stop block window (block_type == 3), in Q30:
+// 1.0 for i in 0..6, round(cos((2(i - 6) + 1)π/24) × 2^30) for i in 6..9,
+// 0 for i in 9..15, round(sin((2(i - 15) + 1)π/24) × 2^30) for i in 15..18.
+static MDCT_WIN_STOP: [i32; 18] = [
+    1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1064555814, 992008094,
+    851856663, 0, 0, 0, 0, 0, 0, 140151432, 410903207, 653652607,
 ];
+
+// Rotation constants of the 9- and 3-point transforms, round(cos(θ) × 2^30).
+const COS_PI_9: i32 = 1008987269; // cos(π/9)
+const COS_2PI_9: i32 = 822533958; // cos(2π/9)
+const COS_4PI_9: i32 = 186453311; // cos(4π/9)
+const COS_PI_6: i32 = 929887697; // cos(π/6)
+const COS_PI_18: i32 = 1057429273; // cos(π/18)
+const COS_5PI_18: i32 = 690187940; // cos(5π/18)
+const COS_7PI_18: i32 = 367241333; // cos(7π/18)
 
 /// 9-point DCT-III used by IMDCT-36. Mirrors minimp3 L3_dct3_9.
 #[inline]
-fn l3_dct3_9(y: *mut f32) {
+fn l3_dct3_9(y: *mut i32) {
     unsafe {
         let mut s0 = *y.add(0);
         let s2 = *y.add(2);
@@ -1112,14 +1183,14 @@ fn l3_dct3_9(y: *mut f32) {
         let mut s6 = *y.add(6);
         let mut s8 = *y.add(8);
 
-        let t0 = s0 + s6 * 0.5;
+        let t0 = s0 + half(s6);
         s0 -= s6;
-        let t4 = (s4 + s2) * 0.93969262;
-        let t2 = (s8 + s2) * 0.76604444;
-        s6 = (s4 - s8) * 0.17364818;
+        let t4 = mul_q30(s4 + s2, COS_PI_9);
+        let t2 = mul_q30(s8 + s2, COS_2PI_9);
+        s6 = mul_q30(s4 - s8, COS_4PI_9);
         s4 += s8 - s2;
 
-        let s2_new = s0 - s4 * 0.5;
+        let s2_new = s0 - half(s4);
         *y.add(4) = s4 + s0;
         s8 = t0 - t2 + s6;
         s0 = t0 - t4 + t2;
@@ -1130,11 +1201,11 @@ fn l3_dct3_9(y: *mut f32) {
         let s5 = *y.add(5);
         let s7 = *y.add(7);
 
-        s3 *= 0.86602540;
-        let t0b = (s5 + s1) * 0.98480775;
-        let t4b = (s5 - s7) * 0.34202014;
-        let t2b = (s1 + s7) * 0.64278761;
-        let s1_new = (s1 - s5 - s7) * 0.86602540;
+        s3 = mul_q30(s3, COS_PI_6);
+        let t0b = mul_q30(s5 + s1, COS_PI_18);
+        let t4b = mul_q30(s5 - s7, COS_7PI_18);
+        let t2b = mul_q30(s1 + s7, COS_5PI_18);
+        let s1_new = mul_q30(s1 - s5 - s7, COS_PI_6);
 
         let s5_new = t0b - s3 - t2b;
         let s7_new = t4b - s3 - t0b;
@@ -1152,14 +1223,14 @@ fn l3_dct3_9(y: *mut f32) {
 }
 
 /// IMDCT-36 with overlap-add and windowing. Mirrors minimp3 L3_imdct36.
-fn l3_imdct36(grbuf: *mut f32, overlap: *mut f32, window: *const f32, nbands: usize) {
+fn l3_imdct36(grbuf: *mut i32, overlap: *mut i32, window: *const i32, nbands: usize) {
     unsafe {
         let mut gr = grbuf;
         let mut ov = overlap;
         let mut j: usize = 0;
         while j < nbands {
-            let mut co = [0f32; 9];
-            let mut si = [0f32; 9];
+            let mut co = [0i32; 9];
+            let mut si = [0i32; 9];
 
             *co.as_mut_ptr().add(0) = -(*gr.add(0));
             *si.as_mut_ptr().add(0) = *gr.add(17);
@@ -1184,13 +1255,17 @@ fn l3_imdct36(grbuf: *mut f32, overlap: *mut f32, window: *const f32, nbands: us
             let twid = G_TWID9.as_ptr();
             let mut i: usize = 0;
             while i < 9 {
-                let ovl = *ov.add(i);
-                let co_i = *co.as_ptr().add(i);
-                let si_i = *si.as_ptr().add(i);
-                let sum = co_i * *twid.add(9 + i) + si_i * *twid.add(i);
-                *ov.add(i) = co_i * *twid.add(i) - si_i * *twid.add(9 + i);
-                *gr.add(i) = ovl * *window.add(i) - sum * *window.add(9 + i);
-                *gr.add(17 - i) = ovl * *window.add(9 + i) + sum * *window.add(i);
+                let ovl = *ov.add(i) as i64;
+                let co_i = *co.as_ptr().add(i) as i64;
+                let si_i = *si.as_ptr().add(i) as i64;
+                let tw_c = *twid.add(i) as i64;
+                let tw_s = *twid.add(9 + i) as i64;
+                let w_c = *window.add(i) as i64;
+                let w_s = *window.add(9 + i) as i64;
+                let sum = round_q30(co_i * tw_s + si_i * tw_c) as i64;
+                *ov.add(i) = round_q30(co_i * tw_c - si_i * tw_s);
+                *gr.add(i) = round_q30(ovl * w_c - sum * w_s);
+                *gr.add(17 - i) = round_q30(ovl * w_s + sum * w_c);
                 i += 1;
             }
 
@@ -1203,10 +1278,10 @@ fn l3_imdct36(grbuf: *mut f32, overlap: *mut f32, window: *const f32, nbands: us
 
 /// 3-point IDCT used by IMDCT-12 (mirrors minimp3 L3_idct3).
 #[inline]
-fn l3_idct3(x0: f32, x1: f32, x2: f32, dst: *mut f32) {
+fn l3_idct3(x0: i32, x1: i32, x2: i32, dst: *mut i32) {
     unsafe {
-        let m1 = x1 * 0.86602540;
-        let a1 = x0 - x2 * 0.5;
+        let m1 = mul_q30(x1, COS_PI_6);
+        let a1 = x0 - half(x2);
         *dst.add(1) = x0 + x2;
         *dst.add(0) = a1 + m1;
         *dst.add(2) = a1 - m1;
@@ -1215,18 +1290,19 @@ fn l3_idct3(x0: f32, x1: f32, x2: f32, dst: *mut f32) {
 
 /// IMDCT-12 (one short window). Mirrors minimp3 L3_imdct12. Reads spectral
 /// values at indices 0,3,6,9,12,15 (stride 3) of x and writes 6 output samples.
-fn l3_imdct12(x: *const f32, dst: *mut f32, overlap: *mut f32) {
+fn l3_imdct12(x: *const i32, dst: *mut i32, overlap: *mut i32) {
     unsafe {
-        // minimp3 g_twid3 = {0.79335334, 0.92387953, 0.99144486, 0.60876143, 0.38268343, 0.13052619}
-        const TW0: f32 = 0.79335334;
-        const TW1: f32 = 0.92387953;
-        const TW2: f32 = 0.99144486;
-        const TW3: f32 = 0.60876143;
-        const TW4: f32 = 0.38268343;
-        const TW5: f32 = 0.13052619;
+        // minimp3 g_twid3 in Q30: round(cos(kπ/24) × 2^30) for k = 5, 3, 1,
+        // then round(sin(kπ/24) × 2^30) for k = 5, 3, 1.
+        const TW0: i32 = 851856663;
+        const TW1: i32 = 992008094;
+        const TW2: i32 = 1064555814;
+        const TW3: i32 = 653652607;
+        const TW4: i32 = 410903207;
+        const TW5: i32 = 140151432;
 
-        let mut co = [0f32; 3];
-        let mut si = [0f32; 3];
+        let mut co = [0i32; 3];
+        let mut si = [0i32; 3];
 
         l3_idct3(
             -*x.add(0),
@@ -1243,28 +1319,29 @@ fn l3_imdct12(x: *const f32, dst: *mut f32, overlap: *mut f32) {
         *si.as_mut_ptr().add(1) = -*si.as_ptr().add(1);
 
         let twid = [TW0, TW1, TW2, TW3, TW4, TW5];
+        let tw = twid.as_ptr();
         let mut i: usize = 0;
         while i < 3 {
-            let ovl = *overlap.add(i);
-            let co_i = *co.as_ptr().add(i);
-            let si_i = *si.as_ptr().add(i);
-            let sum = co_i * *twid.as_ptr().add(3 + i) + si_i * *twid.as_ptr().add(i);
-            *overlap.add(i) = co_i * *twid.as_ptr().add(i) - si_i * *twid.as_ptr().add(3 + i);
-            *dst.add(i) = ovl * *twid.as_ptr().add(2 - i) - sum * *twid.as_ptr().add(5 - i);
-            *dst.add(5 - i) = ovl * *twid.as_ptr().add(5 - i) + sum * *twid.as_ptr().add(2 - i);
+            let ovl = *overlap.add(i) as i64;
+            let co_i = *co.as_ptr().add(i) as i64;
+            let si_i = *si.as_ptr().add(i) as i64;
+            let sum = round_q30(co_i * *tw.add(3 + i) as i64 + si_i * *tw.add(i) as i64) as i64;
+            *overlap.add(i) = round_q30(co_i * *tw.add(i) as i64 - si_i * *tw.add(3 + i) as i64);
+            *dst.add(i) = round_q30(ovl * *tw.add(2 - i) as i64 - sum * *tw.add(5 - i) as i64);
+            *dst.add(5 - i) = round_q30(ovl * *tw.add(5 - i) as i64 + sum * *tw.add(2 - i) as i64);
             i += 1;
         }
     }
 }
 
 /// IMDCT short for `nbands` subbands. Mirrors minimp3 L3_imdct_short.
-fn l3_imdct_short(grbuf: *mut f32, overlap: *mut f32, nbands: usize) {
+fn l3_imdct_short(grbuf: *mut i32, overlap: *mut i32, nbands: usize) {
     unsafe {
         let mut gr = grbuf;
         let mut ov = overlap;
         let mut j: usize = 0;
         while j < nbands {
-            let mut tmp = [0f32; 18];
+            let mut tmp = [0i32; 18];
             let mut i: usize = 0;
             while i < 18 {
                 *tmp.as_mut_ptr().add(i) = *gr.add(i);
@@ -1289,7 +1366,7 @@ fn l3_imdct_short(grbuf: *mut f32, overlap: *mut f32, nbands: usize) {
 
 /// Apply IMDCT to one granule (mirrors minimp3 L3_imdct_gr). Long bands first,
 /// then short for short/mixed.
-fn process_imdct(freq: *mut f32, overlap: *mut f32, block_type: u8, n_long_bands: usize) {
+fn process_imdct(freq: *mut i32, overlap: *mut i32, block_type: u8, n_long_bands: usize) {
     unsafe {
         if n_long_bands > 0 {
             l3_imdct36(freq, overlap, MDCT_WIN_LONG.as_ptr(), n_long_bands);
@@ -1313,7 +1390,7 @@ fn process_imdct(freq: *mut f32, overlap: *mut f32, block_type: u8, n_long_bands
 
 /// L3_change_sign — negate every other sample of every other band, starting
 /// from band 1 sample 1. Required by the polyphase synthesis filterbank.
-fn l3_change_sign(grbuf: *mut f32) {
+fn l3_change_sign(grbuf: *mut i32) {
     unsafe {
         let mut b: usize = 1;
         while b < 32 {
@@ -1332,75 +1409,77 @@ fn l3_change_sign(grbuf: *mut f32) {
 // Section 12: Synthesis filterbank (mirrors minimp3 mp3d_DCT_II / mp3d_synth*)
 // ============================================================================
 
-static G_SEC: [f32; 24] = [
-    10.19000816,
-    0.50060302,
-    0.50241929,
-    3.40760851,
-    0.50547093,
-    0.52249861,
-    2.05778098,
-    0.51544732,
-    0.56694406,
-    1.48416460,
-    0.53104258,
-    0.64682180,
-    1.16943991,
-    0.55310392,
-    0.78815460,
-    0.97256821,
-    0.58293498,
-    1.06067765,
-    0.83934963,
-    0.62250412,
-    1.72244716,
-    0.74453628,
-    0.67480832,
-    5.10114861,
+// minimp3 g_sec, the secants of the 32-point DCT-II's first stage, in Q27
+// (the largest is 10.19): for i in 0..8,
+//   G_SEC[3i]     = round(2^27 / (2 cos((31 - 2i)π/64))),
+//   G_SEC[3i + 1] = round(2^27 / (2 cos((2i + 1)π/64))),
+//   G_SEC[3i + 2] = round(2^27 / (2 cos((4i + 2)π/64))).
+static G_SEC: [i32; 24] = [
+    1367679739, 67189797, 67433575, 457361460, 67843164, 70128577, 276190692, 69182167, 76093940,
+    199201203, 71275330, 86814950, 156959571, 74236348, 105784323, 130535899, 78240207, 142361749,
+    112655602, 83551089, 231182936, 99929967, 90571242, 684664578,
 ];
 
+// The 8-point butterflies' constants, in Q29 (the largest is 2.56).
+const SQRT_HALF_Q29: i32 = 379625062; // round(sqrt(1/2) × 2^29)
+const TAN_PI_16_Q29: i32 = 106790264; // round(tan(π/16) × 2^29)
+const SIN_PI_8_Q29: i32 = 205451603; // round(sin(π/8) × 2^29)
+const SEC_1_Q29: i32 = 273694417; // round(2^29 / (2 cos(π/16)))
+const SEC_2_Q29: i32 = 290552444; // round(2^29 / (2 cos(2π/16)))
+const SEC_3_Q29: i32 = 322844578; // round(2^29 / (2 cos(3π/16)))
+const SEC_5_Q29: i32 = 483171056; // round(2^29 / (2 cos(5π/16)))
+const SEC_6_Q29: i32 = 701455651; // round(2^29 / (2 cos(6π/16)))
+const SEC_7_Q29: i32 = 1375954754; // round(2^29 / (2 cos(7π/16)))
+
+// minimp3 g_win: the ISO synthesis window × 2^16, which ISO defines as exact
+// multiples of 2^-16, so these integers are the window itself.
 #[rustfmt::skip]
-static G_WIN_SYNTH: [f32; 240] = [
-    -1.0,26.0,-31.0,208.0,218.0,401.0,-519.0,2063.0,2000.0,4788.0,-5517.0,7134.0,5959.0,35640.0,-39336.0,74992.0,
-    -1.0,24.0,-35.0,202.0,222.0,347.0,-581.0,2080.0,1952.0,4425.0,-5879.0,7640.0,5288.0,33791.0,-41176.0,74856.0,
-    -1.0,21.0,-38.0,196.0,225.0,294.0,-645.0,2087.0,1893.0,4063.0,-6237.0,8092.0,4561.0,31947.0,-43006.0,74630.0,
-    -1.0,19.0,-41.0,190.0,227.0,244.0,-711.0,2085.0,1822.0,3705.0,-6589.0,8492.0,3776.0,30112.0,-44821.0,74313.0,
-    -1.0,17.0,-45.0,183.0,228.0,197.0,-779.0,2075.0,1739.0,3351.0,-6935.0,8840.0,2935.0,28289.0,-46617.0,73908.0,
-    -1.0,16.0,-49.0,176.0,228.0,153.0,-848.0,2057.0,1644.0,3004.0,-7271.0,9139.0,2037.0,26482.0,-48390.0,73415.0,
-    -2.0,14.0,-53.0,169.0,227.0,111.0,-919.0,2032.0,1535.0,2663.0,-7597.0,9389.0,1082.0,24694.0,-50137.0,72835.0,
-    -2.0,13.0,-58.0,161.0,224.0,72.0,-991.0,2001.0,1414.0,2330.0,-7910.0,9592.0,70.0,22929.0,-51853.0,72169.0,
-    -2.0,11.0,-63.0,154.0,221.0,36.0,-1064.0,1962.0,1280.0,2006.0,-8209.0,9750.0,-998.0,21189.0,-53534.0,71420.0,
-    -2.0,10.0,-68.0,147.0,215.0,2.0,-1137.0,1919.0,1131.0,1692.0,-8491.0,9863.0,-2122.0,19478.0,-55178.0,70590.0,
-    -3.0,9.0,-73.0,139.0,208.0,-29.0,-1210.0,1870.0,970.0,1388.0,-8755.0,9935.0,-3300.0,17799.0,-56778.0,69679.0,
-    -3.0,8.0,-79.0,132.0,200.0,-57.0,-1283.0,1817.0,794.0,1095.0,-8998.0,9966.0,-4533.0,16155.0,-58333.0,68692.0,
-    -4.0,7.0,-85.0,125.0,189.0,-83.0,-1356.0,1759.0,605.0,814.0,-9219.0,9959.0,-5818.0,14548.0,-59838.0,67629.0,
-    -4.0,7.0,-91.0,117.0,177.0,-106.0,-1428.0,1698.0,402.0,545.0,-9416.0,9916.0,-7154.0,12980.0,-61289.0,66494.0,
-    -5.0,6.0,-97.0,111.0,163.0,-127.0,-1498.0,1634.0,185.0,288.0,-9585.0,9838.0,-8540.0,11455.0,-62684.0,65290.0,
+static G_WIN_SYNTH: [i32; 240] = [
+    -1,26,-31,208,218,401,-519,2063,2000,4788,-5517,7134,5959,35640,-39336,74992,
+    -1,24,-35,202,222,347,-581,2080,1952,4425,-5879,7640,5288,33791,-41176,74856,
+    -1,21,-38,196,225,294,-645,2087,1893,4063,-6237,8092,4561,31947,-43006,74630,
+    -1,19,-41,190,227,244,-711,2085,1822,3705,-6589,8492,3776,30112,-44821,74313,
+    -1,17,-45,183,228,197,-779,2075,1739,3351,-6935,8840,2935,28289,-46617,73908,
+    -1,16,-49,176,228,153,-848,2057,1644,3004,-7271,9139,2037,26482,-48390,73415,
+    -2,14,-53,169,227,111,-919,2032,1535,2663,-7597,9389,1082,24694,-50137,72835,
+    -2,13,-58,161,224,72,-991,2001,1414,2330,-7910,9592,70,22929,-51853,72169,
+    -2,11,-63,154,221,36,-1064,1962,1280,2006,-8209,9750,-998,21189,-53534,71420,
+    -2,10,-68,147,215,2,-1137,1919,1131,1692,-8491,9863,-2122,19478,-55178,70590,
+    -3,9,-73,139,208,-29,-1210,1870,970,1388,-8755,9935,-3300,17799,-56778,69679,
+    -3,8,-79,132,200,-57,-1283,1817,794,1095,-8998,9966,-4533,16155,-58333,68692,
+    -4,7,-85,125,189,-83,-1356,1759,605,814,-9219,9959,-5818,14548,-59838,67629,
+    -4,7,-91,117,177,-106,-1428,1698,402,545,-9416,9916,-7154,12980,-61289,66494,
+    -5,6,-97,111,163,-127,-1498,1634,185,288,-9585,9838,-8540,11455,-62684,65290,
 ];
 
 /// DCT-II on grbuf (in-place). Mirrors minimp3 mp3d_DCT_II non-SIMD path.
-fn mp3d_dct_ii(grbuf: *mut f32, n: usize) {
+/// Inputs are saturated at `SUBBAND_MAX` so no intermediate leaves `i32`.
+fn mp3d_dct_ii(grbuf: *mut i32, n: usize) {
+    #[inline(always)]
+    fn load(p: *const i32) -> i32 {
+        unsafe { (*p).clamp(-SUBBAND_MAX, SUBBAND_MAX) }
+    }
     unsafe {
         let mut k: usize = 0;
         while k < n {
             let y = grbuf.add(k);
-            // t is [4][8]: 4 rows × 8 cols of f32 (after restructure).
-            let mut t = [[0f32; 8]; 4];
+            // t is [4][8]: 4 rows × 8 cols (after restructure).
+            let mut t = [[0i32; 8]; 4];
 
             let mut i: usize = 0;
             while i < 8 {
-                let x0 = *y.add(i * 18);
-                let x1 = *y.add((15 - i) * 18);
-                let x2 = *y.add((16 + i) * 18);
-                let x3 = *y.add((31 - i) * 18);
+                let x0 = load(y.add(i * 18));
+                let x1 = load(y.add((15 - i) * 18));
+                let x2 = load(y.add((16 + i) * 18));
+                let x3 = load(y.add((31 - i) * 18));
                 let t0 = x0 + x3;
                 let t1 = x1 + x2;
-                let t2 = (x1 - x2) * *G_SEC.as_ptr().add(3 * i + 0);
-                let t3 = (x0 - x3) * *G_SEC.as_ptr().add(3 * i + 1);
+                let t2 = mul_q27(x1 - x2, *G_SEC.as_ptr().add(3 * i + 0));
+                let t3 = mul_q27(x0 - x3, *G_SEC.as_ptr().add(3 * i + 1));
                 t[0][i] = t0 + t1;
-                t[1][i] = (t0 - t1) * *G_SEC.as_ptr().add(3 * i + 2);
+                t[1][i] = mul_q27(t0 - t1, *G_SEC.as_ptr().add(3 * i + 2));
                 t[2][i] = t3 + t2;
-                t[3][i] = (t3 - t2) * *G_SEC.as_ptr().add(3 * i + 2);
+                t[3][i] = mul_q27(t3 - t2, *G_SEC.as_ptr().add(3 * i + 2));
                 i += 1;
             }
 
@@ -1430,22 +1509,22 @@ fn mp3d_dct_ii(grbuf: *mut f32, n: usize) {
                 x3 = x1 - x2;
                 x1 += x2;
                 x[0] = x0 + x1;
-                x[4] = (x0 - x1) * 0.70710677;
+                x[4] = mul_q29(x0 - x1, SQRT_HALF_Q29);
                 x5 = x5 + x6;
-                x6 = (x6 + x7) * 0.70710677;
+                x6 = mul_q29(x6 + x7, SQRT_HALF_Q29);
                 x7 = x7 + xt;
-                x3 = (x3 + x4) * 0.70710677;
-                x5 = x5 - x7 * 0.198912367; // rotate by PI/8
-                x7 = x7 + x5 * 0.382683432;
-                x5 = x5 - x7 * 0.198912367;
+                x3 = mul_q29(x3 + x4, SQRT_HALF_Q29);
+                x5 = x5 - mul_q29(x7, TAN_PI_16_Q29); // rotate by PI/8
+                x7 = x7 + mul_q29(x5, SIN_PI_8_Q29);
+                x5 = x5 - mul_q29(x7, TAN_PI_16_Q29);
                 let x0b = xt - x6;
                 xt = xt + x6;
-                x[1] = (xt + x7) * 0.50979561;
-                x[2] = (x4 + x3) * 0.54119611;
-                x[3] = (x0b - x5) * 0.60134488;
-                x[5] = (x0b + x5) * 0.89997619;
-                x[6] = (x4 - x3) * 1.30656302;
-                x[7] = (xt - x7) * 2.56291556;
+                x[1] = mul_q29(xt + x7, SEC_1_Q29);
+                x[2] = mul_q29(x4 + x3, SEC_2_Q29);
+                x[3] = mul_q29(x0b - x5, SEC_3_Q29);
+                x[5] = mul_q29(x0b + x5, SEC_5_Q29);
+                x[6] = mul_q29(x4 - x3, SEC_6_Q29);
+                x[7] = mul_q29(xt - x7, SEC_7_Q29);
                 row += 1;
             }
 
@@ -1470,49 +1549,49 @@ fn mp3d_dct_ii(grbuf: *mut f32, n: usize) {
     }
 }
 
+/// A synthesis accumulator (PCM × 2^FRAC_BITS) to int16: rounded to nearest,
+/// clipped to the int16 range.
 #[inline]
-fn mp3d_scale_pcm(sample: f32) -> i16 {
-    // minimp3 "away from zero" rounding to int16.
-    if sample >= 32766.5 {
-        return 32767;
+fn mp3d_scale_pcm(acc: i64) -> i16 {
+    let s = (acc + (1 << (FRAC_BITS - 1))) >> FRAC_BITS;
+    if s > 32767 {
+        32767
+    } else if s < -32768 {
+        -32768
+    } else {
+        s as i16
     }
-    if sample <= -32767.5 {
-        return -32768;
-    }
-    let s = (sample + 0.5) as i32;
-    // minimp3 does `s -= (s < 0)` — only subtract from values already
-    // truncated to a negative int, not based on the float sign.
-    let s = if s < 0 { s - 1 } else { s };
-    s as i16
 }
 
-fn mp3d_synth_pair(pcm: *mut i16, nch: usize, z: *const f32) {
+fn mp3d_synth_pair(pcm: *mut i16, nch: usize, z: *const i32) {
     unsafe {
-        let mut a: f32;
-        a = (*z.add(14 * 64) - *z.add(0)) * 29.0;
-        a += (*z.add(1 * 64) + *z.add(13 * 64)) * 213.0;
-        a += (*z.add(12 * 64) - *z.add(2 * 64)) * 459.0;
-        a += (*z.add(3 * 64) + *z.add(11 * 64)) * 2037.0;
-        a += (*z.add(10 * 64) - *z.add(4 * 64)) * 5153.0;
-        a += (*z.add(5 * 64) + *z.add(9 * 64)) * 6574.0;
-        a += (*z.add(8 * 64) - *z.add(6 * 64)) * 37489.0;
-        a += *z.add(7 * 64) * 75038.0;
+        let zv = |k: usize| *z.add(k * 64) as i64;
+        let mut a: i64;
+        a = (zv(14) - zv(0)) * 29;
+        a += (zv(1) + zv(13)) * 213;
+        a += (zv(12) - zv(2)) * 459;
+        a += (zv(3) + zv(11)) * 2037;
+        a += (zv(10) - zv(4)) * 5153;
+        a += (zv(5) + zv(9)) * 6574;
+        a += (zv(8) - zv(6)) * 37489;
+        a += zv(7) * 75038;
         *pcm = mp3d_scale_pcm(a);
 
         let z2 = z.add(2);
-        a = *z2.add(14 * 64) * 104.0;
-        a += *z2.add(12 * 64) * 1567.0;
-        a += *z2.add(10 * 64) * 9727.0;
-        a += *z2.add(8 * 64) * 64019.0;
-        a += *z2.add(6 * 64) * -9975.0;
-        a += *z2.add(4 * 64) * -45.0;
-        a += *z2.add(2 * 64) * 146.0;
-        a += *z2.add(0 * 64) * -5.0;
+        let zv2 = |k: usize| *z2.add(k * 64) as i64;
+        a = zv2(14) * 104;
+        a += zv2(12) * 1567;
+        a += zv2(10) * 9727;
+        a += zv2(8) * 64019;
+        a += zv2(6) * -9975;
+        a += zv2(4) * -45;
+        a += zv2(2) * 146;
+        a += zv2(0) * -5;
         *pcm.add(16 * nch) = mp3d_scale_pcm(a);
     }
 }
 
-fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
+fn mp3d_synth(xl: *mut i32, dstl: *mut i16, nch: usize, lins: *mut i32) {
     unsafe {
         let xr = xl.add(576 * (nch - 1));
         let dstr = dstl.add(nch - 1);
@@ -1546,14 +1625,16 @@ fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
             *zlin.offset(4 * (i - 16) + 2) = *xl.add(18 * (1 + iu));
             *zlin.offset(4 * (i - 16) + 3) = *xr.add(18 * (1 + iu));
 
-            let mut a = [0f32; 4];
-            let mut b = [0f32; 4];
+            // Accumulators in PCM × 2^FRAC_BITS: 16 products of a sample
+            // (< 2^31) and a window tap (< 2^17) stay far inside i64.
+            let mut a = [0i64; 4];
+            let mut b = [0i64; 4];
 
             // 8 unrolled stages (S0, S2, S1, S2, S1, S2, S1, S2)
             macro_rules! load_k {
                 ($k:expr) => {{
-                    let w0 = *wp;
-                    let w1 = *wp.add(1);
+                    let w0 = *wp as i64;
+                    let w1 = *wp.add(1) as i64;
                     let vz = zlin.offset(4 * i - ($k as isize) * 64);
                     let vy = zlin.offset(4 * i - (15 - $k as isize) * 64);
                     wp = wp.add(2);
@@ -1566,8 +1647,8 @@ fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
                 let (w0, w1, vz, vy) = load_k!(0);
                 let mut j: usize = 0;
                 while j < 4 {
-                    let vzj = *vz.add(j);
-                    let vyj = *vy.add(j);
+                    let vzj = *vz.add(j) as i64;
+                    let vyj = *vy.add(j) as i64;
                     b[j] = vzj * w1 + vyj * w0;
                     a[j] = vzj * w0 - vyj * w1;
                     j += 1;
@@ -1578,8 +1659,8 @@ fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
                 let (w0, w1, vz, vy) = load_k!(1);
                 let mut j: usize = 0;
                 while j < 4 {
-                    let vzj = *vz.add(j);
-                    let vyj = *vy.add(j);
+                    let vzj = *vz.add(j) as i64;
+                    let vyj = *vy.add(j) as i64;
                     b[j] += vzj * w1 + vyj * w0;
                     a[j] += vyj * w1 - vzj * w0;
                     j += 1;
@@ -1590,8 +1671,8 @@ fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
                 let (w0, w1, vz, vy) = load_k!(2);
                 let mut j: usize = 0;
                 while j < 4 {
-                    let vzj = *vz.add(j);
-                    let vyj = *vy.add(j);
+                    let vzj = *vz.add(j) as i64;
+                    let vyj = *vy.add(j) as i64;
                     b[j] += vzj * w1 + vyj * w0;
                     a[j] += vzj * w0 - vyj * w1;
                     j += 1;
@@ -1602,8 +1683,8 @@ fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
                 let (w0, w1, vz, vy) = load_k!(3);
                 let mut j: usize = 0;
                 while j < 4 {
-                    let vzj = *vz.add(j);
-                    let vyj = *vy.add(j);
+                    let vzj = *vz.add(j) as i64;
+                    let vyj = *vy.add(j) as i64;
                     b[j] += vzj * w1 + vyj * w0;
                     a[j] += vyj * w1 - vzj * w0;
                     j += 1;
@@ -1614,8 +1695,8 @@ fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
                 let (w0, w1, vz, vy) = load_k!(4);
                 let mut j: usize = 0;
                 while j < 4 {
-                    let vzj = *vz.add(j);
-                    let vyj = *vy.add(j);
+                    let vzj = *vz.add(j) as i64;
+                    let vyj = *vy.add(j) as i64;
                     b[j] += vzj * w1 + vyj * w0;
                     a[j] += vzj * w0 - vyj * w1;
                     j += 1;
@@ -1626,8 +1707,8 @@ fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
                 let (w0, w1, vz, vy) = load_k!(5);
                 let mut j: usize = 0;
                 while j < 4 {
-                    let vzj = *vz.add(j);
-                    let vyj = *vy.add(j);
+                    let vzj = *vz.add(j) as i64;
+                    let vyj = *vy.add(j) as i64;
                     b[j] += vzj * w1 + vyj * w0;
                     a[j] += vyj * w1 - vzj * w0;
                     j += 1;
@@ -1638,8 +1719,8 @@ fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
                 let (w0, w1, vz, vy) = load_k!(6);
                 let mut j: usize = 0;
                 while j < 4 {
-                    let vzj = *vz.add(j);
-                    let vyj = *vy.add(j);
+                    let vzj = *vz.add(j) as i64;
+                    let vyj = *vy.add(j) as i64;
                     b[j] += vzj * w1 + vyj * w0;
                     a[j] += vzj * w0 - vyj * w1;
                     j += 1;
@@ -1650,8 +1731,8 @@ fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
                 let (w0, w1, vz, vy) = load_k!(7);
                 let mut j: usize = 0;
                 while j < 4 {
-                    let vzj = *vz.add(j);
-                    let vyj = *vy.add(j);
+                    let vzj = *vz.add(j) as i64;
+                    let vyj = *vy.add(j) as i64;
                     b[j] += vzj * w1 + vyj * w0;
                     a[j] += vyj * w1 - vzj * w0;
                     j += 1;
@@ -1673,12 +1754,12 @@ fn mp3d_synth(xl: *mut f32, dstl: *mut i16, nch: usize, lins: *mut f32) {
 }
 
 fn mp3d_synth_granule(
-    qmf_state: *mut f32,
-    grbuf: *mut f32,
+    qmf_state: *mut i32,
+    grbuf: *mut i32,
     nbands: usize,
     nch: usize,
     pcm: *mut i16,
-    lins: *mut f32,
+    lins: *mut i32,
 ) {
     unsafe {
         let mut ch: usize = 0;
@@ -1772,16 +1853,17 @@ pub struct Mp3State {
     // Huffman decoded integer values (per granule/channel, reused)
     huff_values: [i32; 576],
 
-    // Frequency lines after requantization: [2 channels][576] flattened (f32)
-    freq_lines: [f32; 1152],
+    // Frequency lines after requantization: [2 channels][576] flattened
+    // (sample format, Section 5)
+    freq_lines: [i32; 1152],
 
-    // IMDCT overlap buffer: [2 channels][32 subbands × 9] = [2][288] = 576 f32
-    overlap: [f32; 576],
+    // IMDCT overlap buffer: [2 channels][32 subbands × 9] = [2][288] = 576 samples
+    overlap: [i32; 576],
 
     // Synthesis QMF history (shared across channels in mp3d_synth interleave)
-    qmf_state: [f32; 960],
-    // Synthesis working buffer: (18+15)*64 = 2112 f32
-    lins: [f32; 2112],
+    qmf_state: [i32; 960],
+    // Synthesis working buffer: (18+15)*64 = 2112 samples
+    lins: [i32; 2112],
 
     // Output buffer: stereo interleaved
     out_buf: [i16; 2304],
@@ -1821,6 +1903,9 @@ fn sf_idx(gr: usize, ch: usize, band: usize) -> usize {
 // `make minimp3-ref`) to locate the first layer / first frame where
 // our codec disagrees with the reference. The bisection toolchain is
 // gitignored under .context/ — see .context/mp3_bisect/README.md.
+//
+// Sample values print as the raw integers of the sample format (Section 5);
+// divide by 2^FRAC_BITS to compare them with the reference's floats.
 // ============================================================================
 
 // Compile-time gate: `MP3_PROBE=1 make modules TARGET=bcm2712` enables.
@@ -1838,61 +1923,15 @@ fn probe_active(frame_count: u32) -> bool {
     MP3_PROBE && (MP3_PROBE_FRAME_LO..=MP3_PROBE_FRAME_HI).contains(&frame_count)
 }
 
-/// Float-to-decimal with 6 significant digits, sign + dot. Avoids float
-/// formatting deps; used only in probe build.
-unsafe fn fmt_f32_probe(dst: *mut u8, val: f32) -> usize {
-    if val.is_nan() {
-        *dst = b'N';
-        *dst.add(1) = b'a';
-        *dst.add(2) = b'N';
-        return 3;
-    }
+/// A sample in the sample format as a signed decimal integer (raw, not
+/// divided by 2^FRAC_BITS). Used only in probe builds.
+unsafe fn fmt_i32_probe(dst: *mut u8, val: i32) -> usize {
     let mut p = 0usize;
-    let mut v = val;
-    if v < 0.0 {
-        *dst.add(p) = b'-';
-        p += 1;
-        v = -v;
+    if val < 0 {
+        *dst = b'-';
+        p = 1;
     }
-    if v == 0.0 {
-        *dst.add(p) = b'0';
-        return p + 1;
-    }
-    // Find exponent
-    let mut exp: i32 = 0;
-    let mut mant = v;
-    while mant >= 10.0 {
-        mant /= 10.0;
-        exp += 1;
-    }
-    while mant < 1.0 {
-        mant *= 10.0;
-        exp -= 1;
-    }
-    // Emit 6 digits with decimal point after the first digit, then 'e' + exp
-    let mut digits = [0u8; 7];
-    let mut m = mant;
-    for i in 0..7 {
-        let d = m as u32;
-        digits[i] = b'0' + (d as u8 % 10);
-        m = (m - d as f32) * 10.0;
-    }
-    *dst.add(p) = digits[0];
-    p += 1;
-    *dst.add(p) = b'.';
-    p += 1;
-    for i in 1..7 {
-        *dst.add(p) = digits[i];
-        p += 1;
-    }
-    *dst.add(p) = b'e';
-    p += 1;
-    if exp < 0 {
-        *dst.add(p) = b'-';
-        p += 1;
-    }
-    p += fmt_u32_raw(dst.add(p), exp.unsigned_abs());
-    p
+    p + fmt_u32_raw(dst.add(p), val.unsigned_abs())
 }
 
 /// Emit one probe line. tag is at most 6 chars.
@@ -1904,8 +1943,8 @@ unsafe fn probe_emit(
     ch: u8,
     head_label: &[u8],
     head_val: i32,
-    floats: *const f32,
-    n_floats: usize,
+    samples: *const i32,
+    n_samples: usize,
 ) {
     let mut buf = [0u8; 256];
     let bp = buf.as_mut_ptr();
@@ -1947,12 +1986,12 @@ unsafe fn probe_emit(
         }
         p += fmt_u32_raw(bp.add(p), head_val as u32);
     }
-    if !floats.is_null() && n_floats > 0 {
+    if !samples.is_null() && n_samples > 0 {
         let mut i = 0usize;
-        while i < n_floats && p + 16 < 256 {
+        while i < n_samples && p + 16 < 256 {
             *bp.add(p) = b' ';
             p += 1;
-            p += fmt_f32_probe(bp.add(p), *floats.add(i));
+            p += fmt_i32_probe(bp.add(p), *samples.add(i));
             i += 1;
         }
     }
@@ -2142,7 +2181,7 @@ fn decode_frame(s: &mut Mp3State) -> i32 {
                 // Reorder short-block portion (window-interleave).
                 if bt == 2 {
                     let widths_ptr = get_sfb_short_widths(s.sample_rate);
-                    let scratch = s.huff_values.as_mut_ptr() as *mut f32;
+                    let scratch = s.huff_values.as_mut_ptr();
                     let short_start = fl.add(n_long_bands * 18);
                     let nbands_short = 32 - n_long_bands;
                     reorder_short(short_start, scratch, widths_ptr, nbands_short);
@@ -2804,22 +2843,22 @@ pub unsafe fn mp3_init(
 
     let mut i: usize = 0;
     while i < 960 {
-        *s.qmf_state.as_mut_ptr().add(i) = 0.0;
+        *s.qmf_state.as_mut_ptr().add(i) = 0;
         i += 1;
     }
     i = 0;
     while i < 576 {
-        *s.overlap.as_mut_ptr().add(i) = 0.0;
+        *s.overlap.as_mut_ptr().add(i) = 0;
         i += 1;
     }
     i = 0;
     while i < 2112 {
-        *s.lins.as_mut_ptr().add(i) = 0.0;
+        *s.lins.as_mut_ptr().add(i) = 0;
         i += 1;
     }
     i = 0;
     while i < 1152 {
-        *s.freq_lines.as_mut_ptr().add(i) = 0.0;
+        *s.freq_lines.as_mut_ptr().add(i) = 0;
         i += 1;
     }
 

@@ -123,7 +123,7 @@ impl WindowInfo {
 }
 
 /// One TNS filter [spec r01 §4.5], coefficients already mapped to reflection
-/// coefficients [spec r01 §7.6].
+/// coefficients, Q31 [spec r01 §7.6].
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct TnsFilter {
@@ -131,7 +131,7 @@ pub struct TnsFilter {
     pub length: u8,
     pub order: u8,
     pub direction: u8,
-    pub coef: [f32; TNS_MAX_ORDER],
+    pub coef: [i32; TNS_MAX_ORDER],
 }
 
 impl TnsFilter {
@@ -141,15 +141,15 @@ impl TnsFilter {
             length: 0,
             order: 0,
             direction: 0,
-            coef: [0.0; TNS_MAX_ORDER],
+            coef: [0; TNS_MAX_ORDER],
         }
     }
 }
 
 /// Everything parsed for one audio channel of a raw data block, plus its
-/// spectrum: quantised integers after parsing, real coefficients after
-/// dequantisation, in the natural layout (`window * 128 + k` for short
-/// windows) [spec r01 §4.7].
+/// spectrum: quantised integers after parsing, Q`SPEC_FRAC` coefficients
+/// (`tools::SPEC_FRAC`) after dequantisation, in the natural layout
+/// (`window * 128 + k` for short windows) [spec r01 §4.7].
 #[repr(C)]
 pub struct Channel {
     pub info: WindowInfo,
@@ -160,7 +160,7 @@ pub struct Channel {
     /// Scalefactor, intensity position or noise energy per band [spec r01 §4.3].
     pub sf: [[i16; MAX_BANDS]; MAX_GROUPS],
     pub tns: [TnsFilter; MAX_TNS_FILTERS],
-    pub spectrum: [f32; 1024],
+    pub spectrum: [i32; 1024],
 }
 
 impl Channel {
@@ -172,7 +172,7 @@ impl Channel {
             band_cb: [[0; MAX_BANDS]; MAX_GROUPS],
             sf: [[0; MAX_BANDS]; MAX_GROUPS],
             tns: [TnsFilter::zero(); MAX_TNS_FILTERS],
-            spectrum: [0.0; 1024],
+            spectrum: [0; 1024],
         }
     }
 }
@@ -365,9 +365,9 @@ fn apply_pulse(ch: &mut Channel, rate: &Rate, p: &Pulse) -> Result<(), Fault> {
         if k >= 1024 {
             return Err(Fault::Malformed);
         }
-        let a = f32::from(p.amplitude[i]);
+        let a = i32::from(p.amplitude[i]);
         let q = &mut ch.spectrum[k];
-        if *q > 0.0 {
+        if *q > 0 {
             *q += a;
         } else {
             *q -= a;
@@ -403,7 +403,7 @@ fn parse_tns(br: &mut BitReader<'_>, ch: &mut Channel) -> Result<(), Fault> {
                 let compress = br.read(1)?;
                 let nominal = 3 + resolution;
                 let bits = nominal - compress;
-                let table: &[f32] = if nominal == 3 {
+                let table: &[i32] = if nominal == 3 {
                     &TNS_COEF_3
                 } else {
                     &TNS_COEF_4
@@ -429,24 +429,24 @@ fn parse_tns(br: &mut BitReader<'_>, ch: &mut Channel) -> Result<(), Fault> {
 
 /// Decode the values of one codeword of spectral codebook `cb` into `out`
 /// (quads or pairs), with sign bits and escapes [spec r01 §4.7].
-fn spectral_tuple(br: &mut BitReader<'_>, cb: u8, out: &mut [f32; 4]) -> Result<usize, Fault> {
+fn spectral_tuple(br: &mut BitReader<'_>, cb: u8, out: &mut [i32; 4]) -> Result<usize, Fault> {
     let book = tables::codebook(usize::from(cb));
     let dim = usize::from(book.dim);
     let row = huff(br, &book)?;
     let values = &book.values[row * dim..row * dim + dim];
     for (o, &v) in out.iter_mut().zip(values) {
-        *o = f32::from(v);
+        *o = i32::from(v);
     }
     if !HCB_SIGNED[usize::from(cb)] {
         for o in out.iter_mut().take(dim) {
-            if *o != 0.0 && br.bit()? {
+            if *o != 0 && br.bit()? {
                 *o = -*o;
             }
         }
     }
     if cb == 11 {
         for o in out.iter_mut().take(dim) {
-            if *o == 16.0 || *o == -16.0 {
+            if *o == 16 || *o == -16 {
                 let mut n = 0u32;
                 while br.bit()? {
                     n += 1;
@@ -455,8 +455,8 @@ fn spectral_tuple(br: &mut BitReader<'_>, cb: u8, out: &mut [f32; 4]) -> Result<
                     }
                 }
                 let v = br.read(n + 4)?;
-                let mag = ((1u32 << (n + 4)) + v) as f32;
-                *o = if *o < 0.0 { -mag } else { mag };
+                let mag = ((1u32 << (n + 4)) + v) as i32;
+                *o = if *o < 0 { -mag } else { mag };
             }
         }
     }
@@ -466,10 +466,10 @@ fn spectral_tuple(br: &mut BitReader<'_>, cb: u8, out: &mut [f32; 4]) -> Result<
 /// `spectral_data()` into `ch.spectrum` as quantised integers in the natural
 /// layout [spec r01 §4.7].
 fn parse_spectral(br: &mut BitReader<'_>, ch: &mut Channel, rate: &Rate) -> Result<(), Fault> {
-    ch.spectrum = [0.0; 1024];
+    ch.spectrum = [0; 1024];
     let (starts, _) = rate.bands(ch.info.sequence);
     let short = ch.info.sequence == SEQ_EIGHT_SHORT;
-    let mut tuple = [0.0f32; 4];
+    let mut tuple = [0i32; 4];
     let mut window0 = 0usize;
     for g in 0..usize::from(ch.info.num_groups) {
         let windows = usize::from(ch.info.group_len[g]);
