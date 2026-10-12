@@ -11,9 +11,11 @@ tables. It reads the data tables of the specification —
 the Huffman codebooks, the scalefactor-band boundaries, the sampling-rate and
 TNS limit tables — and emits them as Rust, and it computes from the spec's
 formulas the tables the spec says an implementation must compute for itself:
-the Kaiser–Bessel-derived windows, the |q|^(4/3) dequantisation table, the
-2^(x/4) gain table, and the quarter-wave cosine the filterbank's twiddles are
-read from.
+the Kaiser–Bessel-derived windows, the cube-root table the |q|^(4/3)
+dequantisation is built on, the 2^(x/4) gain mantissas, and the quarter-wave
+cosine the filterbank's twiddles are read from. The decoder is fixed point, so
+every formula table is emitted as integers: the value times a stated power of
+two, rounded to nearest.
 
 Before writing anything it re-checks what the spec claims about its own tables
 (every codebook prefix-free with Kraft sum exactly 1; every band width a
@@ -215,21 +217,15 @@ def check_imdct_derivation():
 
 # ── emission ────────────────────────────────────────────────────────────────
 
-def f32(v):
-    """The shortest decimal literal that rounds to the intended f32 exactly
-    (clippy's `excessive_precision` refuses digits an f32 cannot hold)."""
-    import struct
-    bits = struct.pack("f", v)
-    # Search from the f32 value itself, so the shortest literal is the one
-    # Rust prints for it (clippy compares against exactly that).
-    r = struct.unpack("f", bits)[0]
-    for digits in range(1, 10):
-        s = "%.*g" % (digits, r)
-        if struct.pack("f", float(s)) == bits:
-            break
-    if "e" not in s and "." not in s:
-        s += ".0"
-    return s
+def fixed(values, frac_bits):
+    """`round(v * 2^frac_bits)` for each value, as i32 literals; refuses any
+    value the format cannot hold."""
+    out = []
+    for v in values:
+        r = round(v * 2 ** frac_bits)
+        assert -2 ** 31 <= r < 2 ** 31, (v, frac_bits)
+        out.append(str(r))
+    return out
 
 
 def rust_array(name, ty, values, per_line, cite, doc, attrs=()):
@@ -310,8 +306,10 @@ def main():
         # Princen–Bradley: W[n]^2 + W[n + N/2]^2 = 1 with W symmetric.
         assert all(abs(w[n] ** 2 + w[half - 1 - n] ** 2 - 1) < 1e-12 for n in range(half))
     cos_q = [math.cos(2 * math.pi * i / 16384) for i in range(4097)]
-    iq = [i ** (4 / 3) for i in range(8192)]
-    pow2 = [2 ** ((i - 128) / 4) for i in range(289)]
+    cbrt = [i ** (1 / 3) for i in range(8192)]
+    for i in range(21):
+        cbrt[i ** 3] = float(i)  # exact on perfect cubes, where ** (1/3) is not
+    pow2 = [2 ** (i / 4) for i in range(4)]
 
     print("spec %s: T1 ok, %d long tables, %d short tables, 12 codebooks ok, IMDCT derivation ok" % (SPEC_REV, len(longs), len(shorts)))
     if not write:
@@ -359,10 +357,10 @@ def main():
     o.append("pub static TNS_MAX_BAND_LONG: [u8; 13] = [%s];\n" % ", ".join(str(v) for v in tns_long))
     o.append("/// TNS: highest band (exclusive) a filter may reach, short windows. [spec %s T17]\n" % SPEC_REV)
     o.append("pub static TNS_MAX_BAND_SHORT: [u8; 13] = [%s];\n" % ", ".join(str(v) for v in tns_short))
-    o.append(rust_array("TNS_COEF_3", "f32", [f32(v) for v in tns3], 4, "[spec %s §7.6, T18]" % SPEC_REV,
-                        "TNS reflection coefficients at 3-bit resolution, indexed by the code's signed value masked to 3 bits (a compressed 2-bit code masks the same way)."))
-    o.append(rust_array("TNS_COEF_4", "f32", [f32(v) for v in tns4], 4, "[spec %s §7.6, T18]" % SPEC_REV,
-                        "TNS reflection coefficients at 4-bit resolution, indexed by the code's signed value masked to 4 bits."))
+    o.append(rust_array("TNS_COEF_3", "i32", fixed(tns3, 31), 4, "[spec %s §7.6, T18]" % SPEC_REV,
+                        "TNS reflection coefficients at 3-bit resolution as `round(k * 2^31)` (Q31), indexed by the code's signed value masked to 3 bits (a compressed 2-bit code masks the same way)."))
+    o.append(rust_array("TNS_COEF_4", "i32", fixed(tns4, 31), 4, "[spec %s §7.6, T18]" % SPEC_REV,
+                        "TNS reflection coefficients at 4-bit resolution as `round(k * 2^31)` (Q31), indexed by the code's signed value masked to 4 bits."))
     o.append("\n")
     o.append("/// One Huffman codebook as a binary trie. `nodes[n][bit]` is the next node, or,\n"
              "/// with bit 15 set, a leaf carrying the row index. Every trie is complete\n"
@@ -387,17 +385,16 @@ def main():
              "\n")
     o.append("/// Whether spectral codebook `cb` carries signs in its values (else sign bits follow). [spec %s §6.1]\n" % SPEC_REV)
     o.append("pub static HCB_SIGNED: [bool; 12] = [false, true, true, false, false, true, true, false, false, false, false, false];\n\n")
-    o.append(rust_array("KBD_LONG", "f32", [f32(v) for v in kbd_long], 6, "[spec %s §8.2]" % SPEC_REV,
-                        "Rising half of the Kaiser–Bessel-derived window, N = 2048, alpha = 4."))
-    o.append(rust_array("KBD_SHORT", "f32", [f32(v) for v in kbd_short], 6, "[spec %s §8.2]" % SPEC_REV,
-                        "Rising half of the Kaiser–Bessel-derived window, N = 256, alpha = 6."))
-    o.append(rust_array("COS_QUARTER", "f32", [f32(v) for v in cos_q], 6, "[spec %s §8.1, §8.2]" % SPEC_REV,
-                        "cos(2πi/16384) for i = 0..=4096: a quarter wave on the grid every filterbank twiddle and sine-window sample lies on."))
-    o.append(rust_array("IQ_TABLE", "f32", [f32(v) for v in iq], 6, "[spec %s §7.1]" % SPEC_REV,
-                        "|q|^(4/3) for q = 0..8191, the dequantisation magnitude table."))
-    o.append(rust_array("POW2_QUARTER", "f32", [f32(v) for v in pow2], 6, "[spec %s §7.1, §7.4, §7.5]" % SPEC_REV,
-                        "2^((i - 128)/4) for i = 0..288, covering scalefactor gains (x = sf - 100) and the ±120 intensity/noise range.",
-                        attrs=['#[expect(clippy::approx_constant, reason = "2^(2/4) is sqrt(2); the table is one formula, not a list of constants")]']))
+    o.append(rust_array("KBD_LONG", "i32", fixed(kbd_long, 30), 6, "[spec %s §8.2]" % SPEC_REV,
+                        "Rising half of the Kaiser–Bessel-derived window, N = 2048, alpha = 4, as `round(W[n] * 2^30)` (Q30)."))
+    o.append(rust_array("KBD_SHORT", "i32", fixed(kbd_short, 30), 6, "[spec %s §8.2]" % SPEC_REV,
+                        "Rising half of the Kaiser–Bessel-derived window, N = 256, alpha = 6, as `round(W[n] * 2^30)` (Q30)."))
+    o.append(rust_array("COS_QUARTER", "i32", fixed(cos_q, 30), 6, "[spec %s §8.1, §8.2]" % SPEC_REV,
+                        "`round(cos(2πi/16384) * 2^30)` (Q30) for i = 0..=4096: a quarter wave on the grid every filterbank twiddle and sine-window sample lies on."))
+    o.append(rust_array("IQ_CBRT", "i32", fixed(cbrt, 26), 6, "[spec %s §7.1]" % SPEC_REV,
+                        "`round(q^(1/3) * 2^26)` (Q26) for q = 0..8191; the dequantisation magnitude |q|^(4/3) is q times this entry, exact in q."))
+    o.append(rust_array("POW2_FRAC", "i32", fixed(pow2, 30), 4, "[spec %s §7.1, §7.4, §7.5]" % SPEC_REV,
+                        "`round(2^(i/4) * 2^30)` (Q30) for i = 0..3: the mantissa of every quarter-power gain 2^(x/4) = 2^(x>>2) * POW2_FRAC[x&3] / 2^30 (scalefactor gains, intensity positions, noise energies)."))
     OUT_RS.write_text("".join(o))
     # `modules/**` is fmt-checked directly, so the output must already be
     # formatted for whoever regenerates next.
