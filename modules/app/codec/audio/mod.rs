@@ -5,9 +5,9 @@
 //! families, so the root dispatches to all three the same way.
 //!
 //! One file per format beside this one — [`wav`] (PCM passthrough),
-//! [`mp3`] (an f32 port of `minimp3`) — or one directory when a format
-//! needs more than one file, which is [`aac`] and its six generated table
-//! files. That is the same rule [`super::video`] follows for `h264/`.
+//! [`mp3`] (a fixed-point port of `minimp3`) — or one directory when a format
+//! needs more than one file, which is [`aac`] — its syntax, tools and
+//! filterbank beside one generated table file. That is the same rule [`super::video`] follows for `h264/`.
 //!
 //! # Why this family has no shared chassis
 //!
@@ -45,18 +45,18 @@ use super::{
     track_pending, E_AGAIN, IOCTL_NOTIFY, POLL_IN, POLL_OUT,
 };
 
-// `mp3.rs` is an f32 port of CC0 `minimp3`. Its value is being diffable
-// against the C original — a reviewer must be able to put the two side by
-// side and see the same constants and the same loop shapes. Restyling it to
-// satisfy these lints would destroy exactly that. Its correctness is held by
-// `tests/harness/tests/mp3_decode.rs` against ffmpeg.
+// `mp3.rs` is a fixed-point port of CC0 `minimp3`. Its value is being
+// diffable against the C original — a reviewer must be able to put the two
+// side by side and see the same transforms and the same loop shapes, each
+// float constant replaced by an integer whose derivation sits beside it.
+// Restyling it to satisfy these lints would destroy exactly that. Its
+// correctness is held by `tests/harness/tests/mp3_decode.rs` against ffmpeg.
 //
 // The exemption sits HERE, on the port, rather than at the crate root, so the
 // clean-room families (`aac/`, `image/`, `video/`, and this file) stay fully
 // strict. `aac/` is a clean-room implementation from a specification and
 // needs none of it.
 //
-//   excessive_precision / approx_constant  DSP constants and window tables
 //   identity_op / erasing_op               minimp3 writes strides out in full
 //                                          (`z[0*64]`, `y[0*18]`); each was
 //                                          checked individually — none masks
@@ -69,8 +69,6 @@ use super::{
 #[cfg(feature = "aac")]
 pub mod aac;
 #[allow(
-    clippy::excessive_precision,
-    clippy::approx_constant,
     clippy::identity_op,
     clippy::erasing_op,
     clippy::needless_range_loop,

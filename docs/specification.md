@@ -86,7 +86,8 @@ video_in: VideoEncoded
 It declares two variants: `full` (every family) and `audio` (WAV, MP3,
 AAC only — the `pixels` and `video_in` ports are omitted, so wiring
 them in an image or video graph fails at config build, and the module
-arena drops to 64 KiB). Declared targets are rp2350, bcm2712, and wasm;
+arena drops to 64 KiB). Declared targets are rp2350, bcm2712, wasm and
+linux (the hosted `fluxor-linux` runtime);
 each declared target is built by `fluxor modules build --all`.
 
 Alongside it sit `g711` (the PCM ↔ G.711 bridge, µ-law or A-law, on the record stream) and the two BCM2712
@@ -124,6 +125,19 @@ panic, overrun, allocate without a declared ceiling, or continue with
 ambiguous state. A target declaration in a manifest is a claim that
 the module builds and runs there, not an aspiration.
 
+Decoders use integer arithmetic only. Modules on rp2040 and rp2350 are
+built for the soft-float ABI with no floating-point routines to link
+(fluxor keeps the rp2350 FPU off), so a decoder written in `f32` does not
+build there; bcm2712, linux and wasm have native floating point, but a
+second code path for them would need its own conformance evidence. One
+integer path gives every target the same output, bit for bit, so a
+conformance result measured on one target holds on all of them. Each
+fixed-point format states its scale and the bound that keeps it inside
+its integer type, beside the format's definition. Accuracy is held
+against ffmpeg's floating-point decoders: within 2 LSB per sample on
+every audio conformance stream (`tests/harness/tests/aac_decode.rs`,
+`mp3_decode.rs`).
+
 ## Provenance and licensing
 
 The repository licence is Apache-2.0. Each decoder's lineage, from its
@@ -132,7 +146,7 @@ source headers:
 | Decoder | Lineage |
 | --- | --- |
 | H.264 (Constrained Baseline) | Mechanical Rust port of the h264bsd decoder (Apache-2.0), C names kept verbatim. |
-| MP3 | f32 implementation mirroring minimp3 (CC0). |
+| MP3 | Fixed-point implementation mirroring minimp3 (CC0): its transforms and loop shapes, each float constant replaced by an integer derived beside it. |
 | AAC-LC | Clean-room implementation from a written decoder specification; no decoder source consulted by its author. Tables generated from the specification's formulas and codebook rows by `tools/gen/aac_tables.py`. |
 | WAV, BMP, GIF, PNG, JPEG | Implemented in-tree against the published format specifications; no external decoder lineage. |
 | Matroska demux | Clean-room implementation from RFC 8794 (EBML) and the Matroska specification; no reference code consulted. |

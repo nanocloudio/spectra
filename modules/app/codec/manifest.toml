@@ -1,12 +1,12 @@
 version = "2.0.0"
-hardware_targets = ["rp2350", "bcm2712", "wasm"]
+hardware_targets = ["rp2350", "bcm2712", "wasm", "linux"]
 
-# Feature-set variants (RFC module_variants). Build emits one prebuilt
-# fmod per variant: the default (`full`) carries the unsuffixed
-# `codec.fmod` filename so existing YAMLs resolve unchanged;
+# Feature-set variants. Build emits one prebuilt fmod per variant: the
+# default (`full`) carries the unsuffixed `codec.fmod` filename;
 # `codec-audio.fmod` is the constrained-target build — no image/video
-# code, state union shrinks to the largest audio codec, and
-# `module_arena_size` drops from 16 MiB to 64 KiB (the RP2350 win).
+# code, the state union shrinks to the largest audio codec, and
+# `module_arena_size` drops from 47 MiB to 64 KiB, which is what makes the
+# module loadable on rp2350.
 # A YAML selects with `variant: audio` on the module entry; wiring
 # `codec.pixels` against the audio variant fails at config build
 # because the embedded manifest omits the port.
@@ -23,14 +23,19 @@ default = true
 # Exactly one of the three inputs is wired; `module_new` refuses more.
 #
 # in[0]: a file's bytes — a container or bare essence stream (WAV, MP3, ADTS,
-# BMP/GIF/PNG/JPEG, Matroska), identified by sniffing. The bank writes 1024
-# bytes per tick; sized for a healthy lead so writes don't stall while the
-# image path drains a decoded frame and is not reading.
+# BMP/GIF/PNG/JPEG, Matroska), identified by sniffing. A channel write lands
+# whole or not at all, so the ring holds at least the largest unit a producer
+# writes whole: an ADTS frame, at most 8191 bytes (the bank writes 1024). The
+# audio sub-codecs take at most 2048 bytes a step (AAC; MP3 and WAV 256) into
+# their own carry, so 8 KiB is four steps' lead — what the rp2350, which runs
+# only the `audio` variant, gets. On a host the image path drains a decoded
+# frame and is not reading meanwhile, so the ring there is 64 KiB: sixty-four
+# bank writes of lead, so they don't stall.
 [[ports]]
 name = "encoded"
 direction = "input"
 content_type = "OctetStream"
-buffer_size = 65536
+buffer_size = { default = 65536, thumbv8m = 8192 }
 
 # in[1]: an encoded-media record stream (`abi::contracts::encoded`) — AAC (raw
 # with an AudioSpecificConfig, or ADTS) or MP3. The STREAM record names the
@@ -63,14 +68,16 @@ max_payload = 4096
 name = "audio"
 direction = "output"
 content_type = "AudioSample"
-# Request a generous output buffer so a 4-second test asset's worth of
-# PCM (≈720 KB) can buffer through to a slow consumer (e.g. a WS client
-# that connects ~2 s after the source pipeline starts). With the default
-# 8 KB buffer the codec backpressures within ~2 frames; downstream
-# (`ws_stream` → `http`) would then either drop pre-connect bytes at the
-# no-fan-out gate or stall. 1 MiB fits any single-asset test plus several
-# seconds of live decode at typical bitrates.
-buffer_size = 1048576
+# PCM to a player (`i2s_pio`, `audio_out`), which drains it in real time:
+# 192000 bytes a second at 48 kHz stereo 16-bit. The largest record is one
+# AAC block's PCM, 4096 bytes (21.3 ms), written whole; `i2s_pio` takes
+# 2048 bytes (one PIO buffer) a step. Two records — one landing while the
+# player drains the other — are 8 KiB, 42.7 ms of audio: the rp2350's ring.
+# A host's player is stepped by a scheduler with more jitter (a 16 ms frame
+# tick in the browser), so the ring there is eight records, 32 KiB: 170 ms of
+# audio. Everything in the ring still plays after a pause, so the ring is the
+# pause latency too, and is kept to what the player needs.
+buffer_size = { default = 32768, thumbv8m = 8192 }
 # Largest single channel_write across the audio sub-codecs:
 # aac_codec.rs IO_BUF_SIZE = 4096 (mp3 caps chunks at 2048, wav at
 # WAV_IO_BUF_SIZE = 256).

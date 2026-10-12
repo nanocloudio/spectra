@@ -15,7 +15,7 @@ mod.rs           PIC entry points, format detection order, family dispatch
 audio/           essence: sample-domain
   mod.rs           façade + sniffing + the single seam to the root
   wav.rs           PCM passthrough (header parse only)
-  mp3.rs           MPEG-1 Layer III (f32 port of minimp3)
+  mp3.rs           MPEG-1 Layer III (fixed-point port of minimp3)
   aac/             a codec needing more than one file gets a directory
     mod.rs           ADTS framing, stream configuration, block decode, PCM
     bits.rs          bit reader

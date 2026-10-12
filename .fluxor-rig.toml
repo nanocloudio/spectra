@@ -44,17 +44,16 @@ fi
 #
 #    Unconditionally, every run. `fluxor run` and `fluxor build` resolve the
 #    PREBUILT fmod, so editing module source without rebuilding silently
-#    deploys the previous module — an arena change was measured against a stale
-#    fmod exactly once during T2.2.4 before this was understood. That is
-#    standards/rig.md §4's build-freshness trap, and it applies to the host
-#    path too.
+#    deploys the previous module, and a measurement taken that way describes
+#    code that is no longer in the tree. That is standards/rig.md §4's
+#    build-freshness trap, and it applies to the host path too.
 fluxor modules build --target bcm2712
 
-# 3. Purge any 0-byte fmods before combining. A truncated module is accepted
-#    here and rejected later by the image builder with a message that points at
-#    the image rather than the module; 50 of Fluxor's own bcm2712 fmods were
-#    0 bytes on 2026-07-26 (rig.md §4). Fail loudly and early instead.
-find target/fluxor/bcm2712/modules -name '*.fmod' -size -72c -print -delete 2>/dev/null | \\
+# 3. Purge any truncated fmods before combining. An interrupted build leaves
+#    them behind; one is accepted here and rejected later by the image builder
+#    with a message that points at the image rather than the module
+#    (rig.md §4). Fail loudly and early instead.
+find target/fluxor/aarch64/modules -name '*.fmod' -size -72c -print -delete 2>/dev/null | \\
   while read -r f; do echo "rig recipe: removed truncated $f — rebuild it" >&2; done
 
 fluxor build "$1"
@@ -66,10 +65,10 @@ fluxor build "$1"
 #    flat layout.
 #    Resolve by the config's OWN mirrored path, not by basename. Every example
 #    config is named `pi5.yaml`, so a bare `find -name "$STEM.img" | head -1`
-#    matches EVERY example's image and picks an arbitrary one — it silently
-#    booted hevc_probe's image for an hevc_decode scenario on 2026-07-28, which
-#    reads as "my module produced no output" rather than "you ran the wrong
-#    image". That is exactly standards/rig.md §4's staging trap.
+#    matches EVERY example's image and picks an arbitrary one — booting
+#    hevc_probe's image for an hevc_decode scenario, which reads as "my module
+#    produced no output" rather than "you ran the wrong image". That is
+#    standards/rig.md §4's staging trap.
 STEM="$(basename "$1" .yaml)"
 PARENT="$(basename "$(dirname "$1")")"
 DST=target/pi5/images/spectra-pi5.img
