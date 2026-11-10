@@ -63,11 +63,11 @@ use hevc_phase1::{assemble_intra, assemble_intra_wpp, launch, Phase1Intra};
 use hevc_program::{program_phase2, Phase2Launch, RefPic};
 
 // ─── mmio_dma opcodes [Fluxor SDK platform/bcm2712/mmio_dma.rs] ─────────────
-const MMIO_READ32: u32 = 0x0CE4;
-const MMIO_WRITE32: u32 = 0x0CE5;
-const DMA_ALLOC_CONTIG: u32 = 0x0CE6;
-const DMA_FLUSH: u32 = 0x0CEA;
-const DMA_INVALIDATE: u32 = 0x0CEB;
+const MMIO_READ32: u32 = abi::registry::metal_device::MMIO_READ32;
+const MMIO_WRITE32: u32 = abi::registry::metal_device::MMIO_WRITE32;
+const DMA_ALLOC_CONTIG: u32 = abi::registry::metal_device::DMA_ALLOC_CONTIG;
+const DMA_FLUSH: u32 = abi::registry::metal_device::DMA_FLUSH;
+const DMA_INVALIDATE: u32 = abi::registry::metal_device::DMA_INVALIDATE;
 
 /// Per-build marker, echoed in every log line.
 ///
@@ -122,8 +122,8 @@ const OFF_CMDLIST: u64 = page_up(MAX_NAL) as u64;
 /// The command list: one 64-bit word per command. WPP adds ~7 commands per CTB
 /// row on top of the ~50 fixed setup commands, so 4 KiB (512 words) is ample
 /// for any clip this module embeds.
-const CMDLIST_BYTES: u32 = 0x1000;
-const OFF_PU: u64 = OFF_CMDLIST + CMDLIST_BYTES as u64;
+const CMDLIST_BYTES: u64 = 4 * 1024;
+const OFF_PU: u64 = OFF_CMDLIST + CMDLIST_BYTES;
 const OFF_COEFF: u64 = OFF_PU + page_up(PU_BYTES) as u64;
 
 // One output surface per DPB slot. Inter prediction reads a previously decoded

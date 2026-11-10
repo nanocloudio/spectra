@@ -38,11 +38,11 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 /// context [Fluxor SDK `platform/bcm2712/mmio_dma.rs`]. MMIO_READ/WRITE32 read
 /// and write any 32-bit location (register or DRAM) from the kernel, so the
 /// probe touches DMA buffers without depending on the module's own page table.
-const MMIO_READ32: u32 = 0x0CE4;
-const MMIO_WRITE32: u32 = 0x0CE5;
-const DMA_ALLOC_CONTIG: u32 = 0x0CE6;
-const DMA_FLUSH: u32 = 0x0CEA;
-const DMA_INVALIDATE: u32 = 0x0CEB;
+const MMIO_READ32: u32 = abi::registry::metal_device::MMIO_READ32;
+const MMIO_WRITE32: u32 = abi::registry::metal_device::MMIO_WRITE32;
+const DMA_ALLOC_CONTIG: u32 = abi::registry::metal_device::DMA_ALLOC_CONTIG;
+const DMA_FLUSH: u32 = abi::registry::metal_device::DMA_FLUSH;
+const DMA_INVALIDATE: u32 = abi::registry::metal_device::DMA_INVALIDATE;
 
 /// HEVC main register block base [spec r01/r02 §2].
 const HEVC_MAIN_BASE: u64 = 0x10_0080_0000;

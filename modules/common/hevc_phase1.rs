@@ -113,12 +113,7 @@ pub fn assemble_intra(p: &Phase1Intra<'_>, emit: &mut impl FnMut(u64)) -> u32 {
     // 2. CABAC context init [r01 §7.1]: write the array, then save it to the
     //    backup bank so it can be restored later.
     for (k, &word) in p.ctx_init_words.iter().enumerate() {
-        cmd(
-            (hw::P1_WIN_CABAC_INIT + 4 * k as u32) as u16,
-            word,
-            &mut count,
-            emit,
-        );
+        cmd(hw::P1_WIN_CABAC_INIT + 4 * k as u16, word, &mut count, emit);
     }
     cmd(hw::P1_CTX_XFER as u16, hw::P1_CTX_SAVE, &mut count, emit);
 
@@ -126,7 +121,7 @@ pub fn assemble_intra(p: &Phase1Intra<'_>, emit: &mut impl FnMut(u64)) -> u32 {
     //    then commit the batch.
     for (m, &word) in p.slice_msg_words.iter().enumerate() {
         cmd(
-            (hw::P1_WIN_SLICE_MSG + 4 * m as u32) as u16,
+            hw::P1_WIN_SLICE_MSG + 4 * m as u16,
             u32::from(word),
             &mut count,
             emit,
@@ -260,17 +255,12 @@ pub fn assemble_intra_wpp(
         emit,
     );
     for (k, &word) in p.ctx_init_words.iter().enumerate() {
-        cmd(
-            (hw::P1_WIN_CABAC_INIT + 4 * k as u32) as u16,
-            word,
-            &mut count,
-            emit,
-        );
+        cmd(hw::P1_WIN_CABAC_INIT + 4 * k as u16, word, &mut count, emit);
     }
     cmd(hw::P1_CTX_XFER as u16, hw::P1_CTX_SAVE, &mut count, emit);
     for (m, &word) in p.slice_msg_words.iter().enumerate() {
         cmd(
-            (hw::P1_WIN_SLICE_MSG + 4 * m as u32) as u16,
+            hw::P1_WIN_SLICE_MSG + 4 * m as u16,
             u32::from(word),
             &mut count,
             emit,

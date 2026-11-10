@@ -197,10 +197,12 @@ pub const P1_CHECKPOINT_PU_OVERFLOW: u32 = 1 << 4;
 pub const P1_CTX_SAVE: u32 = 0x14500;
 pub const P1_CTX_RESTORE: u32 = 0x14014;
 
-/// Phase-1 command-list data windows [r01 §5].
-pub const P1_WIN_CABAC_INIT: u32 = 0x1000;
-pub const P1_WIN_DEQUANT: u32 = 0x2000;
-pub const P1_WIN_SLICE_MSG: u32 = 0x4000;
+/// Phase-1 command-list data windows [r01 §5]. Unlike the registers above,
+/// these are reached only through a command's 16-bit target field, never as
+/// MMIO offsets, so they carry that field's width.
+pub const P1_WIN_CABAC_INIT: u16 = 0x1000;
+pub const P1_WIN_DEQUANT: u16 = 0x2000;
+pub const P1_WIN_SLICE_MSG: u16 = 0x4000;
 
 // ─── Phase-1 sequence/picture registers [r01 §6.5] ──────────────────────────
 

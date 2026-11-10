@@ -32,9 +32,6 @@ pub const CTX_STATES: usize = 156;
 /// Real (non-padding) context count [r01 §7.1].
 pub const CTX_REAL: usize = 154;
 
-/// Command-window offset the array is written to [r01 §5, §7.1].
-pub const CTX_INIT_WINDOW: u32 = 0x1000;
-
 /// The three `initValue` tables, in the hardware's context ordering [r01 §7.1].
 /// Index with [`crate::hevc_cabac::init_table_index`]. Entries 154 and 155 are
 /// padding and are never fed to the derivation (see [`build`]).
@@ -99,7 +96,7 @@ pub fn build(index: u8, slice_qp: i32) -> [u8; CTX_STATES] {
 
 /// Pack the context-init array into the 39 little-endian 32-bit words the
 /// command window takes, four bytes per word [r01 §7.1]. Word `k` is written to
-/// `CTX_INIT_WINDOW + 4*k`.
+/// `hevc_bcm2712::P1_WIN_CABAC_INIT + 4*k` [r01 §5].
 #[must_use]
 pub fn to_words(array: &[u8; CTX_STATES]) -> [u32; CTX_STATES / 4] {
     let mut words = [0u32; CTX_STATES / 4];

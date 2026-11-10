@@ -105,11 +105,13 @@ fn main() {
 /// Name the register a command targets, decoding the fields that matter for
 /// reading a WPP sequence.
 fn describe(target: u32, value: u32) -> String {
-    if (hw::P1_WIN_CABAC_INIT..hw::P1_WIN_CABAC_INIT + 4 * 39).contains(&target) {
-        return format!("CABAC_INIT[{}]", (target - hw::P1_WIN_CABAC_INIT) / 4);
+    let cabac_init = u32::from(hw::P1_WIN_CABAC_INIT);
+    if (cabac_init..cabac_init + 4 * 39).contains(&target) {
+        return format!("CABAC_INIT[{}]", (target - cabac_init) / 4);
     }
-    if (hw::P1_WIN_SLICE_MSG..hw::P1_WIN_SLICE_MSG + 64).contains(&target) {
-        return format!("SLICE_MSG[{}]", (target - hw::P1_WIN_SLICE_MSG) / 4);
+    let slice_msg = u32::from(hw::P1_WIN_SLICE_MSG);
+    if (slice_msg..slice_msg + 64).contains(&target) {
+        return format!("SLICE_MSG[{}]", (target - slice_msg) / 4);
     }
     match target {
         hw::P1_SEQ_A => "SEQ_A".into(),
