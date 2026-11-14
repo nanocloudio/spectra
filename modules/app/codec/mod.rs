@@ -23,20 +23,13 @@
 //! Only one codec is active at a time.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
-)]
 // ── Lints this module shape trips by construction ─────────────────────────
 //
-// `fluxor ci` clippies every module source at `-D warnings` (it does so
-// directly now that the project has no root manifest), so what is allowed here
-// is a claim about the whole module. Each family below is inherent to *a
-// bare-metal codec module*, not to any one decoder — the decoder-specific
-// exemptions live on the two DSP ports, in `audio/mod.rs`, so the clean-room
-// code stays strict.
+// `fluxor ci` clippies every module source at `-D warnings`, so what is
+// allowed here is a claim about the whole module. Each family below is
+// inherent to *a bare-metal codec module*, not to any one decoder — the
+// decoder-specific exemptions sit on the minimp3 port, in `audio/mod.rs`, so
+// the rest of the code stays strict.
 //
 //   missing_safety_doc        The sub-codec kernels expose
 //                             `pub unsafe fn <fmt>_init/_step/_feed_detect`.
@@ -49,12 +42,6 @@
 //                             stated at each family façade. Twenty-seven copies
 //                             of it would be noise, not documentation.
 //
-//   not_unsafe_ptr_arg_deref  `module_new`/`module_step` take `*mut u8` state
-//                             and a `*const c_void` syscall table because that
-//                             IS the loader ABI. Marking them `unsafe fn` would
-//                             not make the boundary any more checked — there is
-//                             no Rust caller to check.
-//
 //   needless_range_loop       The format decoders walk several arrays in
 //   too_many_arguments        lockstep by index (`raw[i]`, `prev[i]`,
 //                             `out[i]`), and pass a scan's full parameter set
@@ -63,7 +50,6 @@
 //                             or struct rewrites would.
 #![allow(
     clippy::missing_safety_doc,
-    clippy::not_unsafe_ptr_arg_deref,
     clippy::needless_range_loop,
     clippy::too_many_arguments,
     reason = "inherent to a bare-metal codec module; see the comment above"
@@ -95,13 +81,11 @@ compile_error!(
      Rebuild the CLI, or pass --cfg feature=\"...\" flags"
 );
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::contracts::encoded as enc;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ── Essence families ──────────────────────────────────────────────────────
 //
@@ -165,18 +149,27 @@ const FMT_MP3: u8 = 2;
 const FMT_AAC: u8 = 3;
 // image
 const FMT_BMP: u8 = 4;
+#[cfg_attr(
+    not(feature = "image"),
+    expect(
+        dead_code,
+        reason = "named only by the image family; kept so the tag table stays whole"
+    )
+)]
 const FMT_GIF: u8 = 5;
+#[cfg_attr(
+    not(feature = "image"),
+    expect(
+        dead_code,
+        reason = "named only by the image family; kept so the tag table stays whole"
+    )
+)]
 const FMT_PNG: u8 = 6;
 const FMT_JPEG: u8 = 7;
 // video (container-carried)
 const FMT_MKV: u8 = 8;
 // video (record-fed: `video_in`)
 const FMT_ES_H264: u8 = 9;
-
-#[inline(always)]
-fn is_audio_format(fmt: u8) -> bool {
-    (FMT_WAV..=FMT_AAC).contains(&fmt)
-}
 
 #[inline(always)]
 fn is_image_format(fmt: u8) -> bool {
@@ -439,13 +432,12 @@ impl DecoderState {
 
 mod params_def {
     use super::DecoderState;
-    use super::SCHEMA_MAX;
     use super::{p_u16, p_u32, p_u8};
 
     // Image params (1-4). Audio formats have no per-format params
     // today (everything is auto-detected from the bitstream); when
     // they do, append at tag 10+.
-    define_params! {
+    fluxor_rt::define_params! {
         DecoderState;
 
         1, width, u16, 480
@@ -541,6 +533,7 @@ fn detect_format(buf: &[u8; DETECT_BUF_SIZE], len: u8) -> u8 {
 /// quietly stretching is the kind of defect that reads as a decoder bug from
 /// the outside — the picture is simply the wrong shape — so it is named once,
 /// at init, on the same log path as the format commit.
+#[cfg(feature = "image")]
 unsafe fn warn_unimplemented_scale_mode(sys: &SyscallTable, mode: u8) {
     if mode != 0 {
         let msg = b"[dec] scale_mode fit/fill unimplemented - using stretch";
@@ -896,7 +889,7 @@ unsafe fn pump_records(s: &mut DecoderState) {
 
 /// One step of a record-fed module: pump records, then run the bound decoder
 /// and release it once its stream has ended and drained.
-unsafe fn step_records(s: &mut DecoderState) -> i32 {
+unsafe fn step_records(s: &mut DecoderState) -> StepReturn {
     pump_records(s);
     match s.format {
         #[cfg(feature = "h264")]
@@ -920,7 +913,7 @@ unsafe fn step_records(s: &mut DecoderState) -> i32 {
             finish_audio_record_stream(s);
             r
         }
-        _ => 0,
+        _ => StepReturn::Continue,
     }
 }
 
@@ -942,114 +935,62 @@ unsafe fn finish_audio_record_stream(s: &mut DecoderState) {
 // Module API
 // ============================================================================
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<DecoderState>() as u32
-}
-
-/// Per-module heap budget, derived from the ENABLED feature set (RFC
-/// module_variants — this is the primary constrained-target win).
-///
-/// These values are MEASURED, not estimated. `spectra-bench --probe-arena`
-/// binary-searches the smallest arena at which each corpus tier decodes; the
-/// numbers below are that search, rounded up for headroom. The previous
-/// estimate ("≈ 12.5 MiB at 1080p → 16 MiB") under-called the real
-/// requirement by 2–3.5x, which is why no still or video above DVD raster
-/// could be decoded — see `docs/testing/perf-benchmarks.md` §7.
-///
-/// Measured minimum arena, MiB (2026-07-26):
-///
-/// | Raster | BMP | GIF | JPEG | PNG | H.264 |
-/// | --- | --- | --- | --- | --- | --- |
-/// | DVD 720x480/576 | 2 | 4 | 3 | 5 | 6–11 |
-/// | 1080p | 10 | 20 | 17 | 26 | 24–44 |
-/// | 4K | 40 | — | 65 | 97 | 82–116 |
-///
-/// Bitrate matters as much as raster on the video path: `bluray_base`
-/// (crf 23) needs 27 MiB and `bluray_hibitrate` (crf 18) needs 44, because
-/// the elementary-stream accumulator scales with coded frame size rather than
-/// pixel count.
-///
-/// - video (`h264`): **48 MiB** — covers every measured 1080p tier including
-///   the crf 18 worst case, with ~9% headroom.
-/// - image (no video): **32 MiB** — covers every measured 1080p still (PNG at
-///   26 MiB is the worst; inflate window plus full RGB intermediate plus
-///   RGB565 output).
-/// - audio only: 64 KiB. The audio sub-codecs run entirely out of the state
-///   union and allocate nothing — measured 0 bytes high-water across all five
-///   audio tiers — so this is pure margin for incidental allocation.
-///
-/// # Why 47 and not a round number — this is a measured ceiling
-///
-/// 64 MiB was asked for and tried. It does not load, and neither does 48:
-///
-/// ```text
-/// STATE ARENA EXHAUSTED — need=67108872 used=67191136 cap=100663296
-/// ```
-///
-/// Two facts combine, and the second is the surprising one.
-///
-/// 1. `STATE_ARENA_SIZE` is 96 MiB on aarch64 and wasm
-///    (`deps/fluxor/modules/sdk/abi/config.rs`), shared by EVERY module in the
-///    graph and carved eagerly by `loader::alloc_state`.
-/// 2. **The arena is charged twice per load.** Measured, not inferred: at
-///    24 MiB a three-module graph reports `state=50413928` — two 24 MiB
-///    arenas plus one 82 KB module state. At 47 it reports `98648424`, which
-///    is 2 x 47 MiB + state and 98% of the pool. At 48 and 64 the `used`
-///    figure is always exactly one arena plus one state at the moment the
-///    second is requested.
-///
-/// So the usable ceiling is `(96 MiB - state) / 2`, i.e. **47 MiB**, and this
-/// constant sits exactly on it. 47 is not a safety margin — it is the largest
-/// value that loads. It also happens to cover every measured 1080p tier
-/// (worst case 44 MiB, `bluray_hibitrate`), so nothing is lost by stopping
-/// here.
-///
-/// Verified at 47 on all three runtimes:
-///   * linux — `examples/video_player/linux.yaml` decodes 100 PPM frames;
-///   * wasm — `tests/host/video_player_wasm.pw.py` passes all five checks in
-///     a real Firefox (canvas non-blank, frames advancing);
-///   * bcm2712 — the `audio` variant loads and heartbeats on the pi5 board
-///     (its 64 KiB arena is unaffected either way).
-///
-/// **Going higher needs a platform change, not a bigger number here.** 64 MiB
-/// wants `STATE_ARENA_SIZE` at ~132 MiB minimum (realistically 160); 4K wants
-/// ~232 MiB once doubled. That constant lives in Fluxor and is shared by every
-/// project on the platform, and raising it means rebuilding the hash-pinned
-/// kernel and wasm firmware that wave/lattice/quantum also resolve — so it is
-/// a platform decision, deliberately not made from this repo.
-///
-/// **The doubling looks like a Fluxor loader defect.** It halves every
-/// module's usable arena on every project and nothing documents it. Worth
-/// raising independently of the codec; if it is fixed, this constant can
-/// roughly double with no other change.
-///
-/// At 47 MiB the codec consumes 98% of the pool on its own, so a graph that
-/// loads any OTHER arena-requesting module will not fit. That is the real
-/// argument for fixing the doubling rather than living with it.
-///
-/// On rp2350 the whole pool is 256 KiB, so only the audio variant can ever
-/// load there; true before any of this and unchanged by it.
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    if cfg!(feature = "h264") {
+// Per-instance heap arena, by the enabled feature set: the `audio` variant
+// needs almost none, the image and video families need whole rasters.
+//
+// The values are measured, not estimated: `spectra-bench --probe-arena`
+// binary-searches the smallest arena at which each corpus tier decodes.
+//
+// | Raster | BMP | GIF | JPEG | PNG | H.264 |
+// | --- | --- | --- | --- | --- | --- |
+// | DVD 720x480/576 | 2 | 4 | 3 | 5 | 6–11 |
+// | 1080p | 10 | 20 | 17 | 26 | 24–44 |
+// | 4K | 40 | — | 65 | 97 | 82–116 |
+//
+// (MiB.) Bitrate matters as much as raster on the video path: `bluray_base`
+// (crf 23) needs 27 MiB and `bluray_hibitrate` (crf 18) 44, because the
+// elementary-stream accumulator scales with coded frame size rather than
+// pixel count.
+//
+// - video (`h264`): **47 MiB** — every measured 1080p tier, the crf 18 worst
+//   case included.
+// - image (no video): **32 MiB** — every measured 1080p still; PNG at 26 MiB
+//   is the worst (inflate window, full RGB intermediate and RGB565 output).
+// - audio only: **64 KiB**. The audio decoders run out of the state union and
+//   allocate nothing (0 bytes high-water across every audio tier), so this
+//   is margin for incidental allocation.
+//
+// 47 MiB is the wasm ceiling, not a margin. The wasm runtime's state pool is
+// 96 MiB, shared by every module in the graph, and a module's arena was
+// measured to be charged twice at load (a three-module graph at 24 MiB
+// reported two 24 MiB arenas plus the state), so the largest arena that
+// loads is `(96 MiB − state) / 2`. On linux and bcm2712 the pool is 1 GiB and
+// the ceiling far higher; a single value per variant keeps every target on
+// one arithmetic. 4K would need ~116 MiB, which wasm cannot give.
+//
+// On rp2350 only the `audio` variant fits the pool.
+fluxor_rt::module_facts! {
+    state: DecoderState,
+    arena: if cfg!(feature = "h264") {
         47 * 1024 * 1024
     } else if cfg!(feature = "image") {
         32 * 1024 * 1024
     } else {
         64 * 1024
-    }
+    },
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -1115,14 +1056,14 @@ pub extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut DecoderState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         // Once-per-heartbeat re-emit of `[img] decoded` while the
@@ -1192,10 +1133,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let has_in = (poll as u32) & POLL_IN != 0;
             if has_hup && !has_in {
                 dev_channel_ioctl(sys, s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
-                return 0;
+                return StepReturn::Continue;
             }
             if !has_in {
-                return 0;
+                return StepReturn::Continue;
             }
 
             // Read bytes into detect_buf
@@ -1205,7 +1146,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Fallback to WAV
                 s.format = FMT_WAV;
                 init_codec(s);
-                return 0;
+                return StepReturn::Continue;
             }
 
             let to_read = if space > DETECT_IO_SIZE {
@@ -1216,7 +1157,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let read = (sys.channel_read)(s.in_chan, s.detect_io.as_mut_ptr(), to_read);
 
             if read <= 0 {
-                return 0;
+                return StepReturn::Continue;
             }
 
             // Copy read bytes into detect_buf
@@ -1233,10 +1174,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if fmt != FMT_DETECTING {
                 s.format = fmt;
                 init_codec(s);
-                return 2; // Burst — start decoding immediately
+                return StepReturn::Burst; // start decoding this tick
             }
 
-            return 0;
+            return StepReturn::Continue;
         }
 
         // ----------------------------------------------------------------
@@ -1264,7 +1205,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
                     dev_log(s.sys(), 3, b"[dec] rst-mkv".as_ptr(), 13);
                     reset_to_detect(s);
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
         }
@@ -1292,7 +1233,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 dev_log(&*sys_ptr, 3, b"[dec] rst-adv".as_ptr(), 13);
                 dev_channel_ioctl(&*sys_ptr, in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
                 reset_to_detect(s);
-                return 0;
+                return StepReturn::Continue;
             }
 
             // Quiesce path: HUP is set and the ring has drained.
@@ -1306,7 +1247,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     dev_channel_ioctl(&*sys_ptr, in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
                     dev_log(&*sys_ptr, 3, b"[dec] rst".as_ptr(), 9);
                     reset_to_detect(s);
-                    return 0;
+                    return StepReturn::Continue;
                 }
             } else {
                 // Fresh input or HUP-cleared — restart the window.
@@ -1326,7 +1267,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             FMT_BMP | FMT_GIF | FMT_PNG | FMT_JPEG => image::image_step(s.img()),
             #[cfg(feature = "h264")]
             FMT_MKV => video::mkv_step(s.mkv()),
-            _ => 0,
+            _ => StepReturn::Continue,
         }
     }
 }
@@ -1335,7 +1276,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // Panic Handler
 // ============================================================================
 
-// Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
-// module_step_wasm definitions.
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+// Wasm entry-point wrappers (`module_init_wasm` / `module_step_wasm`) —
+// no-op on non-wasm targets.
+fluxor_rt::wasm_entry!();

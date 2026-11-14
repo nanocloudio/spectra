@@ -12,9 +12,9 @@
 
 use super::abi::SyscallTable;
 use super::{
-    dev_channel_ioctl, dev_log, drain_pending, fmt_i16_raw, fmt_u32_raw, track_pending, E_AGAIN,
-    IOCTL_NOTIFY, POLL_IN, POLL_OUT,
+    dev_channel_ioctl, dev_log, fmt_i16_raw, fmt_u32_raw, IOCTL_NOTIFY, POLL_IN, POLL_OUT,
 };
+use fluxor_rt::StepReturn;
 
 // ============================================================================
 // Section 1: Constants, BitReader
@@ -803,18 +803,6 @@ fn get_sfb_short_widths(sample_rate: u32) -> *const u8 {
         SFB_SHORT_W_32000.as_ptr()
     } else {
         SFB_SHORT_W_44100.as_ptr()
-    }
-}
-
-/// Compute long-block SFB widths from the boundary table (22 widths).
-fn long_sfb_widths(sample_rate: u32, out: &mut [u8; 22]) {
-    let t = get_sfb_table(sample_rate);
-    let mut i: usize = 0;
-    while i < 22 {
-        let a = unsafe { *t.add(i) };
-        let b = unsafe { *t.add(i + 1) };
-        out[i] = (b - a) as u8;
-        i += 1;
     }
 }
 
@@ -2916,9 +2904,9 @@ pub unsafe fn mp3_feed_detect(s: &mut Mp3State, buf: *const u8, len: usize) {
     }
 }
 
-pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
+pub unsafe fn mp3_step(s: &mut Mp3State) -> StepReturn {
     if s.syscalls.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let sys = &*s.syscalls;
     let input = s.input;
@@ -2944,7 +2932,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
     if s.id3_skip > 0 {
         let in_poll = input.poll(sys, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         let max_read = if s.id3_skip > IO_BUF_SIZE as u32 {
             IO_BUF_SIZE
@@ -2955,18 +2943,18 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
         if read > 0 {
             s.id3_skip -= read as u32;
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     if s.phase == Mp3Phase::Sync {
         let in_poll = input.poll(sys, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         let read = input.read(sys, s.io_buf.as_mut_ptr(), IO_BUF_SIZE);
         if read <= 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         let count = read as usize;
@@ -3012,12 +3000,12 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
                     } else {
                         s.phase = Mp3Phase::Frame;
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
             pos += 1;
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     if s.phase == Mp3Phase::Frame {
@@ -3026,7 +3014,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
             if s.out_pos >= s.out_len {
                 s.underrun_count += 1;
             }
-            return 0;
+            return StepReturn::Continue;
         }
 
         let needed = s.frame_size - s.frame_pos;
@@ -3037,7 +3025,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
         };
         let read = input.read(sys, s.io_buf.as_mut_ptr(), max_read);
         if read <= 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         let count = read as usize;
@@ -3053,7 +3041,7 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
         if s.frame_pos >= s.frame_size {
             s.phase = Mp3Phase::Decode;
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     if s.phase == Mp3Phase::Decode && s.out_pos >= s.out_len {
@@ -3137,8 +3125,8 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> i32 {
         s.frame_pos = 0;
         s.frame_size = 0;
         s.phase = Mp3Phase::Sync;
-        return 2;
+        return StepReturn::Burst;
     }
 
-    0
+    StepReturn::Continue
 }

@@ -23,37 +23,49 @@
 //! released spec; no GPL source was read.
 
 #![no_std]
-#![allow(
-    dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the SDK and the modules/common HEVC cores; each compile sees the full surface and uses a subset"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 // The real decode logic, mounted from modules/common by path — the same
 // pattern the codec module uses for mkv_demux, and the dependency set the
 // production driver needs. `crate::` paths inside these resolve to this
-// module's root.
+// module's root, which is why they cannot be grouped under one `mod`.
+// A core this bring-up driver uses only part of carries an expectation on its
+// mount: the rest of it serves the host tools and the harness, and the
+// expectation fails the build once the driver uses the whole core.
 #[path = "../../common/bitreader.rs"]
 mod bitreader;
+#[expect(
+    dead_code,
+    reason = "shared core mounted whole; this driver uses a subset"
+)]
 #[path = "../../common/hevc.rs"]
 mod hevc;
 #[path = "../../common/hevc_bcm2712.rs"]
 mod hevc_bcm2712;
+#[expect(
+    dead_code,
+    reason = "shared core mounted whole; this driver uses a subset"
+)]
 #[path = "../../common/hevc_detile.rs"]
 mod hevc_detile;
+#[expect(
+    dead_code,
+    reason = "shared core mounted whole; this driver uses a subset"
+)]
 #[path = "../../common/hevc_phase1.rs"]
 mod hevc_phase1;
 #[path = "../../common/hevc_program.rs"]
 mod hevc_program;
+#[expect(
+    dead_code,
+    reason = "shared core mounted whole; this driver uses a subset"
+)]
 #[path = "../../common/hevc_slice_msg.rs"]
 mod hevc_slice_msg;
 
@@ -83,8 +95,6 @@ const BUILD_NONCE: u32 = 69269;
 
 /// HEVC main register block base [spec §2].
 const HEVC_MAIN_BASE: u64 = 0x10_0080_0000;
-/// Interrupt-control block base [spec §2]. One register at +0x00 [§3].
-const HEVC_IRQ_BASE: u64 = 0x10_0084_0000;
 // ─── The embedded clip ──────────────────────────────────────────────────────
 //
 // Every register constant, the CABAC context-init array and the slice NAL are
@@ -98,6 +108,10 @@ const HEVC_IRQ_BASE: u64 = 0x10_0084_0000;
 // The derivation is trusted because it reproduces the already-silicon-certified
 // 64x64 constants byte-identically (`--expect-certified`) — agreement with a
 // value proven against an ffmpeg reference decode, not mere self-consistency.
+#[expect(
+    dead_code,
+    reason = "generated clip description, read whole by tools/hevc's cmdlist; the module replays its frames"
+)]
 mod clip;
 
 use clip::{
@@ -613,23 +627,19 @@ fn format_result(out: &mut [u8; 256], s: &DecodeState) -> usize {
     n
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<DecodeState>() as u32
-}
+fluxor_rt::module_facts! { state: DecodeState }
 
-/// # Safety
-///
-/// A module ABI entry point: the kernel's loader is the only caller, and it
-/// passes the syscall table it built for this instance. Not callable from Rust.
 #[no_mangle]
 #[link_section = ".text.module_init"]
-pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
+pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -669,14 +679,14 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut DecodeState);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         s.steps = s.steps.wrapping_add(1);
         // Let the net stack come up first, so stage transitions are visible.
@@ -685,7 +695,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let sys = &*s.syscalls;
                 dev_log(sys, 3, b"[hevc] warmup".as_ptr(), 13);
             }
-            return 0;
+            return StepReturn::Continue;
         }
         // One bounded slice of work per step — never spin the scheduler.
         match s.stage {
@@ -702,8 +712,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let len = format_result(&mut line, s);
             dev_log(sys, 3, line.as_ptr(), len);
         }
-        0
+        StepReturn::Continue
     }
 }
-
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");

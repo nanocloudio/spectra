@@ -20,8 +20,8 @@ pub const MAX_TNS_FILTERS: usize = 8;
 /// TNS filter order accepted [spec r01 §4.5, §10].
 pub const TNS_MAX_ORDER: usize = 20;
 
-/// Window sequences [spec r01 §4.1].
-pub const SEQ_LONG: u8 = 0;
+/// Window sequences [spec r01 §4.1]. Sequence 0, only-long, needs no name:
+/// it is what remains once these three are told apart.
 pub const SEQ_LONG_START: u8 = 1;
 pub const SEQ_EIGHT_SHORT: u8 = 2;
 pub const SEQ_LONG_STOP: u8 = 3;
@@ -46,7 +46,6 @@ pub const ID_END: u32 = 7;
 /// [spec r01 T1, T3, T4, T17].
 #[derive(Clone, Copy)]
 pub struct Rate {
-    pub index: u8,
     pub long: &'static [u16],
     pub short: &'static [u16],
     pub tns_long: u8,
@@ -60,16 +59,11 @@ impl Rate {
         }
         let i = index as usize;
         Some(Self {
-            index,
             long: tables::bands_long(tables::LONG_TABLE_OF[i] as usize),
             short: tables::bands_short(tables::SHORT_TABLE_OF[i] as usize),
             tns_long: tables::TNS_MAX_BAND_LONG[i],
             tns_short: tables::TNS_MAX_BAND_SHORT[i],
         })
-    }
-
-    pub fn hz(&self) -> u32 {
-        tables::SAMPLE_RATES[self.index as usize]
     }
 
     /// Band start table and band count for a window sequence.
@@ -110,14 +104,6 @@ impl WindowInfo {
             max_band: 0,
             num_groups: 1,
             group_len: [1, 0, 0, 0, 0, 0, 0, 0],
-        }
-    }
-
-    pub const fn num_windows(&self) -> usize {
-        if self.sequence == SEQ_EIGHT_SHORT {
-            8
-        } else {
-            1
         }
     }
 }

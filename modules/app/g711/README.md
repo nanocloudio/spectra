@@ -55,8 +55,8 @@ stream wrapper — records, backpressure, frame alignment and concealment.
 The encoder reads no more PCM than completes the current unit and emits it the
 step it fills, so its staging is one `STREAM` plus one 40 ms unit. The decoder
 carries at most one record (`UNIT` header plus 1460 bytes) and stages one
-decoded unit (5840 bytes of stereo PCM). Nothing is allocated, so
-`module_arena_size()` is untouched. Each direction keeps its own
+decoded unit (5840 bytes of stereo PCM). Nothing is allocated, so the module
+declares no arena. Each direction keeps its own
 `pending_out` / `pending_offset` pair and drains before reading, so a short
 `channel_write` never drops audio and never lets the two directions interfere.
 

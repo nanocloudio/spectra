@@ -24,6 +24,7 @@
 
 use super::abi::SyscallTable;
 use super::dev_log;
+use fluxor_rt::StepReturn;
 
 pub mod bmp;
 pub mod deflate;
@@ -185,7 +186,7 @@ pub unsafe fn image_is_done(s: &ImageState) -> bool {
 
 // ── Step ──────────────────────────────────────────────────────────────────
 
-pub unsafe fn image_step(s: &mut ImageState) -> i32 {
+pub unsafe fn image_step(s: &mut ImageState) -> StepReturn {
     match s.phase {
         Phase::Error => {
             // A bad header is permanent for the current encoded
@@ -214,7 +215,7 @@ pub unsafe fn image_step(s: &mut ImageState) -> i32 {
                     s.phase = Phase::Error;
                 }
             }
-            0
+            StepReturn::Continue
         }
 
         Phase::Draining => {
@@ -228,7 +229,7 @@ pub unsafe fn image_step(s: &mut ImageState) -> i32 {
                 if w > 0 {
                     s.pending_pos += w as u32;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             // Fully drained — reset for the next image. Bank's
             // IOCTL_FLUSH on the next file lines this up.
@@ -236,12 +237,12 @@ pub unsafe fn image_step(s: &mut ImageState) -> i32 {
             s.encoded_used = 0;
             s.quiet_ticks = 0;
             s.phase = Phase::Ingest;
-            0
+            StepReturn::Continue
         }
 
         Phase::Decoded => {
             s.phase = Phase::Draining;
-            0
+            StepReturn::Continue
         }
 
         Phase::Ingest => {
@@ -256,7 +257,7 @@ pub unsafe fn image_step(s: &mut ImageState) -> i32 {
                 if !reserve_encoded(s, n) {
                     log(s, b"[img] encoded buffer overflow");
                     s.phase = Phase::Error;
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 core::ptr::copy_nonoverlapping(
                     chunk.as_ptr(),
@@ -290,10 +291,10 @@ pub unsafe fn image_step(s: &mut ImageState) -> i32 {
                         s.image_format = f;
                     }
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             if s.encoded_used == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             // End of image. Two ways to know, and the order matters.
             //
@@ -315,15 +316,15 @@ pub unsafe fn image_step(s: &mut ImageState) -> i32 {
             if !ended {
                 s.quiet_ticks = s.quiet_ticks.saturating_add(1);
                 if s.quiet_ticks < EOF_TICKS {
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
             if !decode_buffer(s) {
                 s.phase = Phase::Error;
-                return 0;
+                return StepReturn::Continue;
             }
             s.phase = Phase::Decoded;
-            0
+            StepReturn::Continue
         }
     }
 }
@@ -338,9 +339,9 @@ const DEFAULT_MAX_ENCODED: u32 = 8 * 1024 * 1024;
 /// Initial encoded allocation. `max_bytes` is a CEILING, not the size to
 /// grab up front — the buffer grows toward it on demand (see
 /// [`reserve_encoded`]). Eagerly allocating the full ceiling would starve
-/// the module heap: a 16 MiB `max_bytes` against the codec's 10 MiB
-/// `module_arena_size()` fails every `heap_alloc`, so the image never
-/// decodes and downstream sinks (linux_display) get no frame.
+/// the module heap: a `max_bytes` above the arena the module declares fails
+/// every `heap_alloc`, so the image never decodes and downstream sinks
+/// (linux_display) get no frame.
 const INITIAL_ENCODED_CAP: u32 = 256 * 1024;
 
 #[inline]
@@ -414,11 +415,6 @@ pub(super) fn le_u32(b: &[u8], off: usize) -> u32 {
 #[inline(always)]
 pub(super) fn le_i32(b: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
-
-#[inline(always)]
-pub(super) fn be_u16(b: &[u8], off: usize) -> u16 {
-    u16::from_be_bytes([b[off], b[off + 1]])
 }
 
 #[inline(always)]

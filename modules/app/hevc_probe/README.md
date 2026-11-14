@@ -18,8 +18,9 @@ Answering those *before* adding DMA is the whole point:
 when rung 3 later reports a command list that did not advance, this rung has
 already eliminated "the block was never powered" as the cause.
 
-bcm2712 only, `permissions = ["platform_raw"]`, `timer_class = "agnostic"` —
-it reads no clock.
+bcm2712 only, `grants = ["metal_device.mmio", "metal_device.dma"]` (the
+version read and the DMA round-trip), `timer_class = "agnostic"` — it reads no
+clock.
 
 ## Ports
 

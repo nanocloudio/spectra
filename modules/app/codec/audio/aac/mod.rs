@@ -34,6 +34,7 @@ use super::input::Input;
 use super::{dev_log, drain_pending, track_pending, POLL_IN};
 use bits::BitReader;
 use filterbank::Scratch;
+use fluxor_rt::StepReturn;
 use syntax::{
     Channel, MsInfo, Rate, ID_CCE, ID_CPE, ID_DSE, ID_END, ID_FIL, ID_LFE, ID_PCE, ID_SCE,
 };
@@ -371,7 +372,7 @@ fn decode_block(d: &mut Decoder, br: &mut BitReader<'_>) -> Result<(), Fault> {
 
 /// One step: drain owed output, read input, decode at most one raw data
 /// block, write its PCM.
-pub unsafe fn aac_step(s: &mut AacState) -> i32 {
+pub unsafe fn aac_step(s: &mut AacState) -> StepReturn {
     let sys = &*s.syscalls;
     if !drain_pending(
         sys,
@@ -380,7 +381,7 @@ pub unsafe fn aac_step(s: &mut AacState) -> i32 {
         &mut s.pending_out,
         &mut s.pending_offset,
     ) {
-        return 0;
+        return StepReturn::Continue;
     }
     let in_len = s.in_len as usize;
     if in_len < IN_BUF {
@@ -396,10 +397,10 @@ pub unsafe fn aac_step(s: &mut AacState) -> i32 {
 
     if s.frame_open == 0 {
         let Some(h) = sync(s) else {
-            return 0;
+            return StepReturn::Continue;
         };
         if (s.in_len as usize) < usize::from(h.frame_length) {
-            return 0; // wait for the whole frame
+            return StepReturn::Continue; // wait for the whole frame
         }
         s.header = h;
         s.frame_open = 1;
@@ -442,7 +443,7 @@ pub unsafe fn aac_step(s: &mut AacState) -> i32 {
             let bytes = 1024 * usize::from(s.dec.channels) * 2;
             let written = (sys.channel_write)(s.out_chan, s.dec.pcm.as_ptr(), bytes);
             track_pending(written, bytes, &mut s.pending_out, &mut s.pending_offset);
-            2
+            StepReturn::Burst
         }
         Err(Fault::Unsupported) => {
             if s.refused_logged == 0 {
@@ -452,7 +453,7 @@ pub unsafe fn aac_step(s: &mut AacState) -> i32 {
             }
             consume(s, frame_len);
             s.frame_open = 0;
-            0
+            StepReturn::Continue
         }
         Err(_) => {
             // Discard the frame and resume scanning one byte after its sync
@@ -462,7 +463,7 @@ pub unsafe fn aac_step(s: &mut AacState) -> i32 {
             s.dec.overlap = [[0; 1024]; MAX_CHANNELS];
             consume(s, 1);
             s.frame_open = 0;
-            0
+            StepReturn::Continue
         }
     }
 }

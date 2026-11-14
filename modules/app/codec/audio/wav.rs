@@ -7,7 +7,8 @@
 // Standalone: modules/wav.rs (unchanged, still builds independently)
 
 use super::abi::SyscallTable;
-use super::{dev_log, drain_pending, p_u32, track_pending, POLL_IN, POLL_OUT};
+use super::{dev_log, drain_pending, track_pending, POLL_IN, POLL_OUT};
+use fluxor_rt::StepReturn;
 
 // ============================================================================
 // Constants
@@ -233,9 +234,9 @@ pub unsafe fn wav_is_done(s: &WavState) -> bool {
 }
 
 /// Step the WAV codec. Returns 0 on success.
-pub unsafe fn wav_step(s: &mut WavState) -> i32 {
+pub unsafe fn wav_step(s: &mut WavState) -> StepReturn {
     if s.syscalls.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
 
     let sys = &*s.syscalls;
@@ -243,7 +244,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
     let out_chan = s.out_chan;
 
     if s.phase == WavPhase::Done {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // Drain pending output
@@ -256,21 +257,21 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
             &mut s.pending_offset,
         )
     {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // State: PARSING_HEADER
     if s.phase == WavPhase::ParsingHeader {
         let in_poll = input.poll(sys, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         let space = HEADER_BUF_SIZE - (s.header_len as usize);
         if space == 0 {
             dev_log(sys, 1, b"[wav] hdr too big".as_ptr(), 16);
             s.phase = WavPhase::Done;
-            return 0;
+            return StepReturn::Continue;
         }
 
         let read = input.read(
@@ -279,7 +280,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
             space,
         );
         if read <= 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         s.header_len += read as u16;
@@ -323,7 +324,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
                                 s.pending_out = chunk as u16;
                                 s.data_read += written_total as u32;
                                 s.phase = WavPhase::StreamingData;
-                                return 0;
+                                return StepReturn::Continue;
                             }
 
                             let written = (sys.channel_write)(out_chan, s.io_buf.as_ptr(), chunk);
@@ -338,14 +339,14 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
                                 if s.pending_out > 0 {
                                     s.data_read += written_total as u32;
                                     s.phase = WavPhase::StreamingData;
-                                    return 0;
+                                    return StepReturn::Continue;
                                 }
                             } else {
                                 s.pending_offset = 0;
                                 s.pending_out = chunk as u16;
                                 s.data_read += written_total as u32;
                                 s.phase = WavPhase::StreamingData;
-                                return 0;
+                                return StepReturn::Continue;
                             }
                         }
                         s.data_read += written_total as u32;
@@ -356,20 +357,20 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
                 s.phase = WavPhase::SkippingToData;
             }
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     // State: SKIPPING_TO_DATA
     if s.phase == WavPhase::SkippingToData {
         let in_poll = input.poll(sys, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         let remaining = s.data_offset - s.bytes_consumed;
         if remaining == 0 {
             s.phase = WavPhase::StreamingData;
-            return 0;
+            return StepReturn::Continue;
         }
 
         let to_read = if remaining as usize > WAV_IO_BUF_SIZE {
@@ -380,7 +381,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
 
         let read = input.read(sys, s.io_buf.as_mut_ptr(), to_read);
         if read <= 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         s.bytes_consumed += read as u32;
@@ -388,7 +389,7 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
             s.phase = WavPhase::StreamingData;
         }
 
-        return 0;
+        return StepReturn::Continue;
     }
 
     // State: STREAMING_DATA
@@ -396,17 +397,17 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
         if s.data_size > 0 && s.data_read >= s.data_size {
             s.phase = WavPhase::Done;
             dev_log(sys, 3, b"[wav] done".as_ptr(), 10);
-            return 0;
+            return StepReturn::Continue;
         }
 
         let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
         if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         let in_poll = input.poll(sys, POLL_IN);
         if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         let data_remaining = if s.data_size > 0 {
@@ -423,12 +424,12 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
         if to_read == 0 {
             s.phase = WavPhase::Done;
             dev_log(sys, 3, b"[wav] done".as_ptr(), 10);
-            return 0;
+            return StepReturn::Continue;
         }
 
         let read = input.read(sys, s.io_buf.as_mut_ptr(), to_read);
         if read <= 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         let byte_count = read as usize;
@@ -455,8 +456,8 @@ pub unsafe fn wav_step(s: &mut WavState) -> i32 {
             &mut s.pending_offset,
         );
 
-        return 0;
+        return StepReturn::Continue;
     }
 
-    0
+    StepReturn::Continue
 }

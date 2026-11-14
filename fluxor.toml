@@ -4,15 +4,14 @@
 name    = "spectra"
 version = "0.0.1"
 
-# fluxor provides the module SDK source (abi.rs, runtime.rs, params.rs,
-# varint.rs, wasm_entry.rs, the PIC linker script) materialised into
-# target/fluxor/fluxor-abi/sdk/, plus the `fluxor-linux` runtime binary.
-# `modules/app/codec/mod.rs` `include!`s that SDK; Spectra never vendors a
-# second copy of it.
+# fluxor provides the module SDK as three crates materialised by `fluxor sync`
+# under target/fluxor/ — `fluxor-abi` (ABI, contracts, wire), `fluxor-rt` (the
+# module runtime, its macros and the PIC linker script) and `fluxor-sdk`
+# (crypto, shared cores) — plus the `fluxor-linux` runtime binary. Spectra's
+# modules link those crates; Spectra never vendors a copy of them.
 [dependencies]
 fluxor = "0.0.1"
-# Protocol modules (http, ws_stream, rtp, websocket) live in wave since the
-# extraction; fluxor's copy is now `http_edge` (workload-ingress variant).
+# Protocol modules (http, ws_stream, rtp, websocket) come from wave.
 wave   = "0.0.1"
 
 [required]
@@ -64,8 +63,12 @@ mode                = "strict"
 # diffing against the reference decoders) — each carries its own reason at
 # the site.
 [[ci.hygiene.allow_crate_root]]
-prefix = "modules/"
-reason = """PIC modules mount the fluxor SDK wholesale via include!, so each compile sees the entire surface and uses a subset; the codec ports additionally keep whole-file allows as module-shape claims, with reasons at each site."""
+prefix = "modules/app/codec/"
+reason = """The codec's crate-root allows are claims about the module's shape rather than any one decoder: its sub-codec kernels are `pub unsafe fn` only so the host harness can drive them, sharing one safety contract stated at each family façade, and its format decoders walk arrays in lockstep by index and pass a scan's parameters positionally, as the specifications do. `modules/app/codec/mod.rs` states each at the site."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/common/"
+reason = """A shared core defines a whole surface — a register map, a uAPI, a stream contract, a container's element set — and is compiled into several consumers (the modules that mount it, the host harness, tools/hevc), each using a different subset. Which items are dead depends on the consumer, so the allow cannot move onto an item as an expectation: it would fail in whichever consumer uses that item. Each core states its own surface at the site."""
 
 [ci.test]
 # CI phase 3.5 project gates, in order:

@@ -6,8 +6,9 @@ clip's NALs, assembles the phase-1 command list, launches the entropy engine,
 programs phase 2, and samples the reconstructed luma surface to prove the frame
 is right.
 
-bcm2712 only, `permissions = ["platform_raw"]` — every register access goes
-through mediated `MMIO_READ32` / `MMIO_WRITE32`.
+bcm2712 only, `grants = ["metal_device.mmio", "metal_device.dma"]` — every
+register access goes through mediated `MMIO_READ32` / `MMIO_WRITE32`, and its
+buffers come from `DMA_ALLOC_CONTIG`.
 
 ## The two-engine model
 

@@ -46,13 +46,6 @@ struct HuffDec {
 }
 
 impl HuffDec {
-    const fn new() -> Self {
-        Self {
-            counts: [0; MAX_CODE_LEN + 1],
-            symbols: [0; LIT_SYMS],
-        }
-    }
-
     /// Build a canonical Huffman decoder from per-symbol code
     /// lengths. Returns false if the code is over-subscribed (a
     /// well-formed code uses ≤ 1.0 of the 2^max_len code space).

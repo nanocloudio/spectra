@@ -1,12 +1,11 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
-# `platform_raw` gates raw MMIO (0x0CE4/0x0CE5); `dma` separately gates DMA
-# buffer allocation and cache maintenance (0x0CE6/0x0CE7/0x0CEA-0x0CEC). The
-# kernel split the two — a module that only reads registers should not be able
-# to allocate contiguous physical memory — so this driver, which does both,
-# must declare both. `hevc_probe` reads one register and correctly needs only
-# the first.
-permissions = ["platform_raw", "dma"]
+# `metal_device.mmio` grants the register reads and writes (`MMIO_READ32`,
+# `MMIO_WRITE32`); `metal_device.dma` grants contiguous DMA allocation and its
+# cache maintenance (`DMA_ALLOC_CONTIG`, `DMA_FLUSH`, `DMA_INVALIDATE`). The
+# registry gates them separately — a module that only reads registers cannot
+# allocate physical memory — and this driver does both.
+grants = ["metal_device.mmio", "metal_device.dma"]
 
 # BCM2712 HEVC phase-1 execution probe — rung 3 of the bare-metal bring-up
 # ladder, after the version read (rung 1) and the DMA round-trip (rung 2).

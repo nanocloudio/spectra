@@ -1,12 +1,11 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
-# `platform_raw` for the MMIO version read (0x0CE4); `dma` for the rung-2
-# round-trip (0x0CE6 alloc + 0x0CEA/0x0CEB cache maintenance), which the kernel
-# gates separately. The two were one permission until upstream split them; this
-# module declared only the first, so its DMA stage began failing silently —
-# `pi5_hevc_probe` kept passing because its pass rule only covers the version
-# read, and `pi5_hevc_dma` is the rung that actually checks it.
-permissions = ["platform_raw", "dma"]
+# `metal_device.mmio` for the version read (`MMIO_READ32`); `metal_device.dma`
+# for the DMA round-trip (`DMA_ALLOC_CONTIG`, `DMA_FLUSH`, `DMA_INVALIDATE`),
+# which the registry gates separately. A module missing the second still reads
+# the version register, so the round-trip is the stage that fails — which is
+# why `pi5_hevc_probe` carries a fail rule on it.
+grants = ["metal_device.mmio", "metal_device.dma"]
 
 # BCM2712 HEVC decode block bring-up probe. The first bare-metal contact with
 # the block: it reads the hardware version register (spec r01/r02 §2/§6.1,

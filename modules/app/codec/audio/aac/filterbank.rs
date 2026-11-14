@@ -281,6 +281,8 @@ pub fn frame(
                     z[1024 + n] = windowed(x[1024 + n], window(cur, true, 1023 - n));
                 }
             }
+            // Only-long: the field is two bits, and eight-short took the
+            // branch above.
             _ => {
                 for n in 0..1024 {
                     z[n] = windowed(x[n], window(prev_shape, true, n));

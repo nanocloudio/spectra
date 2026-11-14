@@ -116,8 +116,9 @@ A graph that only needs one output side leaves the other unwired.
 - **`full`** (default, ships as `codec.fmod`) — every family.
 - **`audio`** (`codec-audio.fmod`) — `wav`+`mp3`+`aac` only. Drops the
   image and video code, their terms in the state union, the `video_in` port,
-  and the large arena request: `module_arena_size()` falls from 47 MiB to
-  64 KiB, which is what makes the module loadable on rp2350 at all.
+  and the large arena request: the arena its `module_facts!` declares falls
+  from 47 MiB to 64 KiB, which is what makes the module loadable on rp2350 at
+  all.
 
 Wiring `codec.pixels` or `codec.video_in` against the audio variant fails at
 config-build time because the embedded manifest omits the port.
@@ -131,10 +132,11 @@ consumer. `#[path]` rather than `include!` keeps the file byte-identical:
 it carries its own inner `#![allow]` attributes, which rustc rejects when
 macro-spliced into a `mod` body.
 
-The SDK (`abi.rs`, `runtime.rs`, `params.rs`) is mounted the same way from
-`target/fluxor/fluxor-abi/sdk/`, materialised by `fluxor sync`. It is
-gitignored, so a bare `cargo` invocation in a freshly-cleaned tree will
-fail to resolve `mod abi` until you have synced.
+The Fluxor SDK is not mounted but linked: three crates (`fluxor-abi`,
+`fluxor-rt`, `fluxor-sdk`) that `fluxor sync` stages under `target/fluxor/`,
+which the module imports (`use fluxor_abi as abi; use fluxor_rt::*;`) and the
+module build links. They are gitignored, so a freshly cleaned tree builds
+nothing until it has been synced.
 
 ## Validating a decoder
 

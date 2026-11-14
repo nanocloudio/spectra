@@ -19,20 +19,13 @@
 //! (r01/r02 §2, §6.1). Reads only — no decode, DMA, or interrupts.
 
 #![no_std]
-#![allow(
-    dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts the SDK via include!/mod; each module's compile sees the full ABI surface and uses a subset"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 /// `mmio_dma` opcodes — mediated register + DMA operations performed in kernel
 /// context [Fluxor SDK `platform/bcm2712/mmio_dma.rs`]. MMIO_READ/WRITE32 read
@@ -170,23 +163,19 @@ fn format_line(out: &mut [u8; 32], value: u32) -> usize {
     n
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ProbeState>() as u32
-}
+fluxor_rt::module_facts! { state: ProbeState }
 
-/// # Safety
-///
-/// A module ABI entry point: the kernel's loader is the only caller, and it
-/// passes the syscall table it built for this instance. Not callable from Rust.
 #[no_mangle]
 #[link_section = ".text.module_init"]
-pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
+pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -241,15 +230,15 @@ fn format_dma(out: &mut [u8; 64], phys: u64, readback: u32, ok: bool) -> usize {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut ProbeState);
         s.steps = s.steps.wrapping_add(1);
         if s.syscalls.is_null() {
-            return 0;
+            return StepReturn::Continue;
         }
         // The DMA round-trip allocates, so it runs exactly once, on the first
         // step, before any logging depends on it.
@@ -269,8 +258,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let dlen = format_dma(&mut dma_line, s.dma_phys, s.dma_readback, s.dma_ok);
             dev_log(sys, 3, dma_line.as_ptr(), dlen);
         }
-        0
+        StepReturn::Continue
     }
 }
-
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");

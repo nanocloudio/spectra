@@ -44,6 +44,7 @@ use super::container::matroska::{
 };
 use super::scale::Nearest;
 use super::{dev_flow_budget, dev_log, dev_millis};
+use fluxor_rt::StepReturn;
 
 pub mod h264;
 
@@ -569,9 +570,9 @@ unsafe fn es_compact(s: &mut MkvH264State) {
 
 // ── Step ──────────────────────────────────────────────────────────────────
 
-pub unsafe fn mkv_step(s: &mut MkvH264State) -> i32 {
+pub unsafe fn mkv_step(s: &mut MkvH264State) -> StepReturn {
     match s.phase {
-        VPhase::Error | VPhase::Done => 0,
+        VPhase::Error | VPhase::Done => StepReturn::Continue,
 
         VPhase::Drain => {
             if s.pending_pos < s.pending_size {
@@ -604,22 +605,22 @@ pub unsafe fn mkv_step(s: &mut MkvH264State) -> i32 {
                 if w > 0 {
                     s.pending_pos += w as u32;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             s.pending_pos = 0;
             s.pending_size = 0;
             // More output pictures queued in the DPB?
             if s.more_pics != 0 {
                 if !pace_ok(s) {
-                    return 0; // hold in Drain until the next frame is due
+                    return StepReturn::Continue; // hold in Drain until the next frame is due
                 }
                 if next_picture(s) {
-                    return 2; // keep draining
+                    return StepReturn::Burst; // keep draining
                 }
             }
             s.more_pics = 0;
             s.phase = VPhase::Run;
-            2
+            StepReturn::Burst
         }
 
         VPhase::Run => {
@@ -628,11 +629,11 @@ pub unsafe fn mkv_step(s: &mut MkvH264State) -> i32 {
             // decode further until the output queue drains.
             if s.more_pics != 0 {
                 if !pace_ok(s) {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if next_picture(s) {
                     s.phase = VPhase::Drain;
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 // DPB output queue empty — resume decoding.
             }
@@ -646,7 +647,7 @@ pub unsafe fn mkv_step(s: &mut MkvH264State) -> i32 {
                     s.quiet_ticks = 0;
                     feed_demux(s, &chunk[..n as usize]);
                     if s.phase == VPhase::Error {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
             }
@@ -665,33 +666,33 @@ pub unsafe fn mkv_step(s: &mut MkvH264State) -> i32 {
                 match ret {
                     h264::H264BSD_HDRS_RDY => {
                         on_headers(s);
-                        return 2;
+                        return StepReturn::Burst;
                     }
                     h264::H264BSD_PIC_RDY => {
                         // Emit via the paced path at the top of Run.
                         s.more_pics = 1;
-                        return 2;
+                        return StepReturn::Burst;
                     }
                     h264::H264BSD_RDY => {
                         if read_bytes == 0 {
                             // Decoder wants more data than buffered
                             // (mid-NAL). Compact and wait for input.
                             es_compact(s);
-                            return 0;
+                            return StepReturn::Continue;
                         }
-                        return 2;
+                        return StepReturn::Burst;
                     }
                     h264::H264BSD_MEMALLOC_ERROR => {
                         set_err(s, b"[mkv] decode memalloc error");
                         s.phase = VPhase::Error;
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     _ => {
                         // Stream errors: h264bsd conceals and carries
                         // on; hard param-set errors end the stream.
                         set_err(s, b"[mkv] decode error");
                         s.phase = VPhase::Error;
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
             }
@@ -718,11 +719,11 @@ pub unsafe fn mkv_step(s: &mut MkvH264State) -> i32 {
                         h264_decoder::h264bsdFlushBuffer(&mut s.storage);
                         s.flushed = 1;
                         s.more_pics = 1;
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     if s.more_pics != 0 {
                         // Tail frames still owed (pacing) — hold.
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     dev_log(
                         s.syscalls.as_ref().unwrap_unchecked(),
@@ -735,7 +736,7 @@ pub unsafe fn mkv_step(s: &mut MkvH264State) -> i32 {
             } else {
                 s.quiet_ticks = 0;
             }
-            0
+            StepReturn::Continue
         }
     }
 }

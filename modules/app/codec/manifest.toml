@@ -5,7 +5,7 @@ hardware_targets = ["rp2350", "bcm2712", "wasm", "linux"]
 # default (`full`) carries the unsuffixed `codec.fmod` filename;
 # `codec-audio.fmod` is the constrained-target build — no image/video
 # code, the state union shrinks to the largest audio codec, and
-# `module_arena_size` drops from 47 MiB to 64 KiB, which is what makes the
+# the arena its `module_facts!` declares drops from 47 MiB to 64 KiB, which is what makes the
 # module loadable on rp2350.
 # A YAML selects with `variant: audio` on the module entry; wiring
 # `codec.pixels` against the audio variant fails at config build

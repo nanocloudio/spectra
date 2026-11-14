@@ -18,26 +18,14 @@
 //! verbatim with the host tests; this module is the stream wrapper.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    dead_code,
-    unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
-)]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "the module ABI entry points take raw state, params and syscall pointers whose validity is the runtime's half of the contract; the signature is fixed by that contract rather than chosen here"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::contracts::encoded as enc;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // The companding core, mounted by `#[path]` so the module and the host tests
 // compile the same bytes. Host-test builds expose it; PIC builds keep it private.
@@ -170,10 +158,9 @@ impl G711State {
 mod params_def {
     use super::enc;
     use super::G711State;
-    use super::SCHEMA_MAX;
     use super::{p_u8, CODEC_UNSUPPORTED, PTIME_MAX_MS};
 
-    define_params! {
+    fluxor_rt::define_params! {
         G711State;
         // Milliseconds of audio per encoded unit: 10, 20, 30 or 40. Anything
         // else reads as the RFC 3551 default of 20.
@@ -423,19 +410,19 @@ fn reset_decode_stream(s: &mut G711State) {
     s.dec_expect_pts = None;
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<G711State>() as u32
-}
+fluxor_rt::module_facts! { state: G711State }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -479,19 +466,17 @@ pub extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut G711State);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         step_encode(s);
         step_decode(s);
-        0
+        StepReturn::Continue
     }
 }
-
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
