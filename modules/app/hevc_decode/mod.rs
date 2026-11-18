@@ -74,12 +74,7 @@ use hevc_detile::{luma_offset_8bit, Surface};
 use hevc_phase1::{assemble_intra, assemble_intra_wpp, launch, Phase1Intra};
 use hevc_program::{program_phase2, Phase2Launch, RefPic};
 
-// ─── mmio_dma opcodes [Fluxor SDK platform/bcm2712/mmio_dma.rs] ─────────────
-const MMIO_READ32: u32 = abi::registry::metal_device::MMIO_READ32;
-const MMIO_WRITE32: u32 = abi::registry::metal_device::MMIO_WRITE32;
-const DMA_ALLOC_CONTIG: u32 = abi::registry::metal_device::DMA_ALLOC_CONTIG;
-const DMA_FLUSH: u32 = abi::registry::metal_device::DMA_FLUSH;
-const DMA_INVALIDATE: u32 = abi::registry::metal_device::DMA_INVALIDATE;
+use abi::contracts::hal::metal_device as md;
 
 /// Per-build marker, echoed in every log line.
 ///
@@ -216,6 +211,12 @@ struct DecodeState {
     out_chan: i32,
     steps: u32,
     done: bool,
+    /// The device aperture holding the HEVC block, and the block's offset in
+    /// it; `regs` is negative until the aperture is open.
+    regs: i32,
+    regs_off: u32,
+    /// The DMA allocation's handle, negative until it is made.
+    dma: i32,
     /// Outcome, logged repeatedly so the UDP monitor is sure to see it.
     dma_base: u64,
     cmd_count: u32,
@@ -235,46 +236,73 @@ struct DecodeState {
     frames_done: u32,
 }
 
-unsafe fn mmio_read32(sys: &SyscallTable, addr: u64) -> u32 {
-    let mut buf = [0u8; 12];
-    buf[..8].copy_from_slice(&addr.to_le_bytes());
-    if (sys.provider_call)(-1, MMIO_READ32, buf.as_mut_ptr(), 12) < 0 {
+/// Open the device aperture that holds `addr`: its handle and `addr`'s offset
+/// in it, or `None` when no aperture of the machine covers it.
+unsafe fn open_aperture_at(sys: &SyscallTable, addr: u64) -> Option<(i32, u32)> {
+    let mut index = 0u8;
+    loop {
+        let mut arg = [0u8; md::mmio::OPEN_LEN];
+        arg[0] = index;
+        let h = (sys.provider_call)(
+            -1,
+            md::MMIO_OPEN,
+            arg.as_mut_ptr(),
+            arg.len(),
+            core::ptr::null_mut(),
+            0,
+        );
+        if h < 0 {
+            return None;
+        }
+        let base = u64::from_le_bytes([
+            arg[0], arg[1], arg[2], arg[3], arg[4], arg[5], arg[6], arg[7],
+        ]);
+        let len = u32::from_le_bytes([arg[8], arg[9], arg[10], arg[11]]);
+        if addr >= base && addr - base < u64::from(len) {
+            return Some((h, (addr - base) as u32));
+        }
+        index = index.checked_add(1)?;
+    }
+}
+
+/// Read the HEVC block's register at `off`; 0 on error.
+unsafe fn reg_read(s: &DecodeState, off: u32) -> u32 {
+    let mut arg = md::mmio::arg(s.regs_off + off, 0);
+    let rc = ((*s.syscalls).provider_call)(
+        s.regs,
+        md::MMIO_READ32,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    if rc < 0 {
         return 0;
     }
-    u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
+    u32::from_le_bytes([arg[4], arg[5], arg[6], arg[7]])
 }
 
-unsafe fn mmio_write32(sys: &SyscallTable, addr: u64, val: u32) {
-    let mut buf = [0u8; 12];
-    buf[..8].copy_from_slice(&addr.to_le_bytes());
-    buf[8..12].copy_from_slice(&val.to_le_bytes());
-    (sys.provider_call)(-1, MMIO_WRITE32, buf.as_mut_ptr(), 12);
+/// Write the HEVC block's register at `off`.
+unsafe fn reg_write(sys: &SyscallTable, regs: i32, regs_off: u32, off: u32, val: u32) {
+    let mut arg = md::mmio::arg(regs_off + off, val);
+    (sys.provider_call)(
+        regs,
+        md::MMIO_WRITE32,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
-unsafe fn dma_alloc_contig(sys: &SyscallTable, size: u32, align: u32) -> u64 {
-    let mut buf = [0u8; 16];
-    buf[..4].copy_from_slice(&size.to_le_bytes());
-    buf[4..8].copy_from_slice(&align.to_le_bytes());
-    if (sys.provider_call)(-1, DMA_ALLOC_CONTIG, buf.as_mut_ptr(), 16) < 0 {
-        return 0;
-    }
-    u64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ])
+/// Store a 32-bit word into the DMA allocation at `addr`.
+unsafe fn dma_write32(addr: u64, val: u32) {
+    core::ptr::write_volatile(addr as usize as *mut u32, val);
 }
 
-unsafe fn dma_flush(sys: &SyscallTable, addr: u64, size: u32) {
-    let mut buf = [0u8; 12];
-    buf[..8].copy_from_slice(&addr.to_le_bytes());
-    buf[8..12].copy_from_slice(&size.to_le_bytes());
-    (sys.provider_call)(-1, DMA_FLUSH, buf.as_mut_ptr(), 12);
-}
-
-unsafe fn dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) {
-    let mut buf = [0u8; 12];
-    buf[..8].copy_from_slice(&addr.to_le_bytes());
-    buf[8..12].copy_from_slice(&size.to_le_bytes());
-    (sys.provider_call)(-1, DMA_INVALIDATE, buf.as_mut_ptr(), 12);
+/// Load a 32-bit word from the DMA allocation at `addr`.
+unsafe fn dma_read32(addr: u64) -> u32 {
+    core::ptr::read_volatile(addr as usize as *const u32)
 }
 
 /// Run phase 1 for the current frame: stage the bitstream, build and stage the
@@ -287,20 +315,28 @@ unsafe fn dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) {
 unsafe fn run_phase1(s: &mut DecodeState) {
     let sys = &*s.syscalls;
 
-    if s.dma_base == 0 {
-        let base = dma_alloc_contig(sys, BUF_BYTES, 64);
-        s.dma_base = base;
-        if base == 0 {
+    if s.regs < 0 {
+        let Some((regs, off)) = open_aperture_at(sys, HEVC_MAIN_BASE) else {
             s.done = true;
             return;
-        }
+        };
+        s.regs = regs;
+        s.regs_off = off;
+    }
+    if s.dma < 0 {
+        let Some(region) = dev_dma_alloc(sys, BUF_BYTES, 64) else {
+            s.done = true;
+            return;
+        };
+        s.dma = region.handle;
+        s.dma_base = region.addr;
     }
     let base = s.dma_base;
+    let (regs, regs_off) = (s.regs, s.regs_off);
     let f = &FRAMES[s.frame];
 
-    // 1. Stage the slice NAL. Written 32 bits at a time through the mediated
-    //    syscall (the module does not map DMA memory itself). The final word
-    //    covers the odd tail byte; the buffer has ample slack.
+    // 1. Stage the slice NAL, 32 bits at a time. The final word covers the
+    //    odd tail byte; the buffer has ample slack.
     let nal = clip::nal(s.frame);
     let n = nal.len();
     let mut i = 0usize;
@@ -309,8 +345,7 @@ unsafe fn run_phase1(s: &mut DecodeState) {
         let b1 = if i + 1 < n { nal[i + 1] } else { 0 };
         let b2 = if i + 2 < n { nal[i + 2] } else { 0 };
         let b3 = if i + 3 < n { nal[i + 3] } else { 0 };
-        mmio_write32(
-            sys,
+        dma_write32(
             base + OFF_BITSTREAM + i as u64,
             u32::from_le_bytes([b0, b1, b2, b3]),
         );
@@ -348,8 +383,8 @@ unsafe fn run_phase1(s: &mut DecodeState) {
     let mut w = 0u64;
     let mut stage_word = |word: u64| {
         let addr = base + OFF_CMDLIST + w * 8;
-        mmio_write32(sys, addr, (word & 0xFFFF_FFFF) as u32);
-        mmio_write32(sys, addr + 4, (word >> 32) as u32);
+        dma_write32(addr, (word & 0xFFFF_FFFF) as u32);
+        dma_write32(addr + 4, (word >> 32) as u32);
         w += 1;
     };
     // WPP needs the §6.8 row-pause/context-save/restore sequence; without it
@@ -363,14 +398,14 @@ unsafe fn run_phase1(s: &mut DecodeState) {
     s.cmd_count = count;
 
     // 3. Push everything to the point of coherency before the engine reads it.
-    dma_flush(sys, base, BUF_BYTES);
+    dev_dma_flush(sys, s.dma, 0, BUF_BYTES);
 
     // 4. Launch. The final write (P1_LIST_BASE) starts the engine [§5].
     launch(
         &params,
         ((base + OFF_CMDLIST) >> 6) as u32,
         count,
-        &mut |off: u32, val: u32| mmio_write32(sys, HEVC_MAIN_BASE + u64::from(off), val),
+        &mut |off: u32, val: u32| reg_write(sys, regs, regs_off, off, val),
     );
 
     // Launched. Completion is polled across subsequent steps [§5].
@@ -379,13 +414,12 @@ unsafe fn run_phase1(s: &mut DecodeState) {
 
 /// Poll `P1_LIST_DONE` for a bounded slice of this step [§5].
 unsafe fn poll_phase1(s: &mut DecodeState) {
-    let sys = &*s.syscalls;
     let mut i = 0u32;
     while i < POLLS_PER_STEP {
-        s.list_done = mmio_read32(sys, HEVC_MAIN_BASE + u64::from(hw::P1_LIST_DONE));
+        s.list_done = reg_read(s, hw::P1_LIST_DONE);
         s.polls += 1;
         if s.list_done >= s.cmd_count {
-            s.checkpoint = mmio_read32(sys, HEVC_MAIN_BASE + u64::from(hw::P1_CHECKPOINT));
+            s.checkpoint = reg_read(s, hw::P1_CHECKPOINT);
             // Reconstruction may only run once phase 1 consumed the whole
             // list, since it reads phase 1's intermediate streams [§11].
             if ENABLE_PHASE2 {
@@ -397,7 +431,7 @@ unsafe fn poll_phase1(s: &mut DecodeState) {
             return;
         }
         if s.polls >= POLL_BUDGET {
-            s.checkpoint = mmio_read32(sys, HEVC_MAIN_BASE + u64::from(hw::P1_CHECKPOINT));
+            s.checkpoint = reg_read(s, hw::P1_CHECKPOINT);
             s.stage = ST_DONE;
             s.done = true;
             return;
@@ -450,7 +484,7 @@ unsafe fn finish_phase2(s: &mut DecodeState) {
     // which is only correct if motion compensation read the right reference.
     let slot = FRAMES[FRAMES.len() - 1].out_slot;
     let out_y = off_out_y(slot);
-    dma_invalidate(sys, base + out_y, OUT_Y_BYTES);
+    dev_dma_invalidate(sys, s.dma, out_y as u32, SURF_Y);
 
     let surface = Surface::new(clip::WIDTH, clip::HEIGHT, clip::BIT_DEPTH);
     let mut k = 0usize;
@@ -459,7 +493,7 @@ unsafe fn finish_phase2(s: &mut DecodeState) {
         let off = luma_offset_8bit(surface, x, y) as u64;
         // Never read outside the plane the engine was told to write.
         s.luma[k] = if off + 4 <= u64::from(OUT_Y_BYTES) {
-            mmio_read32(sys, base + out_y + off)
+            dma_read32(base + out_y + off)
         } else {
             0
         };
@@ -475,7 +509,7 @@ const SAMPLES: usize = 4;
 /// Probe point `k`: CTB row `k` (clamped to the picture), 20 pixels into the
 /// picture's last CTB column. Derived from geometry rather than hardcoded, so
 /// the same driver samples sensibly for a 1-CTB clip and a 4x4 one alike.
-/// x is 4-aligned so the mediated 32-bit read stays aligned.
+/// x is 4-aligned so the 32-bit read stays aligned.
 fn sample_point(k: usize) -> (u32, u32) {
     let x = (u32::from(CTB_LAST_COL) * clip::CTB_SIZE + 20).min(clip::WIDTH - 4) & !3;
     // Clamp the PIXEL row, not the CTB index: for a picture with fewer CTB rows
@@ -490,6 +524,7 @@ fn sample_point(k: usize) -> (u32, u32) {
 unsafe fn start_phase2(s: &mut DecodeState) {
     let sys = &*s.syscalls;
     let base = s.dma_base;
+    let (regs, regs_off) = (s.regs, s.regs_off);
 
     // NOTE: the interrupt block (§3) is deliberately NOT touched here. It sits
     // at 0x10_0084_0000, a different page from the main register block, and is
@@ -545,7 +580,7 @@ unsafe fn start_phase2(s: &mut DecodeState) {
     };
 
     program_phase2(&p2, &mut |off: u32, val: u32| {
-        mmio_write32(sys, HEVC_MAIN_BASE + u64::from(off), val)
+        reg_write(sys, regs, regs_off, off, val)
     });
 
     // Launched; the completion latch is polled across subsequent steps [§3].
@@ -661,6 +696,9 @@ pub unsafe extern "C" fn module_new(
         s.out_chan = out_chan;
         s.steps = 0;
         s.done = false;
+        s.regs = -1;
+        s.regs_off = 0;
+        s.dma = -1;
         s.dma_base = 0;
         s.cmd_count = 0;
         s.list_done = 0;

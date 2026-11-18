@@ -232,7 +232,7 @@ pub unsafe fn image_step(s: &mut ImageState) -> StepReturn {
                 return StepReturn::Continue;
             }
             // Fully drained — reset for the next image. Bank's
-            // IOCTL_FLUSH on the next file lines this up.
+            // FLUSH on the next file lines this up.
             s.pending_pos = 0;
             s.encoded_used = 0;
             s.quiet_ticks = 0;
