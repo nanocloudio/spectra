@@ -1,7 +1,7 @@
 //! BCM2712 HEVC decode block — bare-metal bring-up probe.
 //!
 //! The first bare-metal contact with the hardware HEVC decoder. It reads the
-//! block's version register over the mediated `MMIO_READ32` syscall and logs
+//! block's version register over the mediated `MMIO_READ32` call and logs
 //! the value. That single read answers the two questions that gate everything
 //! downstream:
 //!
@@ -27,20 +27,12 @@ use fluxor_abi as abi;
 
 use fluxor_rt::*;
 
-/// `mmio_dma` opcodes — mediated register + DMA operations performed in kernel
-/// context [Fluxor SDK `platform/bcm2712/mmio_dma.rs`]. MMIO_READ/WRITE32 read
-/// and write any 32-bit location (register or DRAM) from the kernel, so the
-/// probe touches DMA buffers without depending on the module's own page table.
-const MMIO_READ32: u32 = abi::registry::metal_device::MMIO_READ32;
-const MMIO_WRITE32: u32 = abi::registry::metal_device::MMIO_WRITE32;
-const DMA_ALLOC_CONTIG: u32 = abi::registry::metal_device::DMA_ALLOC_CONTIG;
-const DMA_FLUSH: u32 = abi::registry::metal_device::DMA_FLUSH;
-const DMA_INVALIDATE: u32 = abi::registry::metal_device::DMA_INVALIDATE;
+use abi::contracts::hal::metal_device as md;
 
 /// HEVC main register block base [spec r01/r02 §2].
 const HEVC_MAIN_BASE: u64 = 0x10_0080_0000;
 /// Version register offset within the main block [spec r01/r02 §6.1].
-const P1_VERSION: u64 = 0x3C;
+const P1_VERSION: u32 = 0x3C;
 /// Expected value on supported silicon [spec r01/r02 §2, §6.1].
 const HW_VERSION: u32 = 0x202;
 
@@ -62,54 +54,60 @@ struct ProbeState {
     /// DMA test outcome, computed once on the first step. `dma_done` guards it
     /// so the (allocating) test runs exactly once.
     dma_done: bool,
+    /// The device aperture holding the HEVC block, and the block's offset in
+    /// it; `regs` is negative until the aperture is open.
+    regs: i32,
+    regs_off: u32,
     dma_phys: u64,
     dma_readback: u32,
     dma_ok: bool,
 }
 
-/// Mediated 32-bit MMIO read. Returns 0 on syscall error, matching how the
-/// SMMU module reports an inaccessible register.
-unsafe fn mmio_read32(sys: &SyscallTable, addr: u64) -> u32 {
-    let mut buf = [0u8; 12];
-    let ab = addr.to_le_bytes();
-    buf[..8].copy_from_slice(&ab);
-    let rc = (sys.provider_call)(-1, MMIO_READ32, buf.as_mut_ptr(), 12);
+/// Open the device aperture that holds `addr`: its handle and `addr`'s offset
+/// in it, or `None` when no aperture of the machine covers it.
+unsafe fn open_aperture_at(sys: &SyscallTable, addr: u64) -> Option<(i32, u32)> {
+    let mut index = 0u8;
+    loop {
+        let mut arg = [0u8; md::mmio::OPEN_LEN];
+        arg[0] = index;
+        let h = (sys.provider_call)(
+            -1,
+            md::MMIO_OPEN,
+            arg.as_mut_ptr(),
+            arg.len(),
+            core::ptr::null_mut(),
+            0,
+        );
+        if h < 0 {
+            return None;
+        }
+        let base = u64::from_le_bytes([
+            arg[0], arg[1], arg[2], arg[3], arg[4], arg[5], arg[6], arg[7],
+        ]);
+        let len = u32::from_le_bytes([arg[8], arg[9], arg[10], arg[11]]);
+        if addr >= base && addr - base < u64::from(len) {
+            return Some((h, (addr - base) as u32));
+        }
+        index = index.checked_add(1)?;
+    }
+}
+
+/// Mediated 32-bit register read at `offset` in aperture `regs`. Returns 0 on
+/// error, matching how the SMMU module reports an inaccessible register.
+unsafe fn mmio_read32(sys: &SyscallTable, regs: i32, offset: u32) -> u32 {
+    let mut arg = md::mmio::arg(offset, 0);
+    let rc = (sys.provider_call)(
+        regs,
+        md::MMIO_READ32,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    );
     if rc < 0 {
         return 0;
     }
-    u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
-}
-
-/// Mediated 32-bit write (register or DRAM), performed in kernel context.
-unsafe fn mmio_write32(sys: &SyscallTable, addr: u64, val: u32) {
-    let mut buf = [0u8; 12];
-    buf[..8].copy_from_slice(&addr.to_le_bytes());
-    buf[8..12].copy_from_slice(&val.to_le_bytes());
-    (sys.provider_call)(-1, MMIO_WRITE32, buf.as_mut_ptr(), 12);
-}
-
-/// Allocate a contiguous DMA buffer. Returns its physical address, or 0 on
-/// failure. Arg layout: `[size:u32][align:u32][phys:u64 out]`.
-unsafe fn dma_alloc_contig(sys: &SyscallTable, size: u32, align: u32) -> u64 {
-    let mut buf = [0u8; 16];
-    buf[..4].copy_from_slice(&size.to_le_bytes());
-    buf[4..8].copy_from_slice(&align.to_le_bytes());
-    let rc = (sys.provider_call)(-1, DMA_ALLOC_CONTIG, buf.as_mut_ptr(), 16);
-    if rc < 0 {
-        return 0;
-    }
-    u64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ])
-}
-
-/// Clean a DRAM range to the point of coherency before a device reads it, or
-/// invalidate it before the CPU reads what a device wrote. Arg: `[addr:u64][size:u32]`.
-unsafe fn dma_cache_op(sys: &SyscallTable, op: u32, addr: u64, size: u32) {
-    let mut buf = [0u8; 12];
-    buf[..8].copy_from_slice(&addr.to_le_bytes());
-    buf[8..12].copy_from_slice(&size.to_le_bytes());
-    (sys.provider_call)(-1, op, buf.as_mut_ptr(), 12);
+    u32::from_le_bytes([arg[4], arg[5], arg[6], arg[7]])
 }
 
 /// Allocate a DMA buffer and round-trip a pattern through it — CPU write,
@@ -120,17 +118,20 @@ unsafe fn dma_cache_op(sys: &SyscallTable, op: u32, addr: u64, size: u32) {
 /// path the driver will depend on.
 unsafe fn run_dma_test(s: &mut ProbeState) {
     let sys = &*s.syscalls;
-    let phys = dma_alloc_contig(sys, 4096, 64);
-    s.dma_phys = phys;
-    if phys == 0 {
+    let Some(region) = dev_dma_alloc(sys, 4096, 64) else {
+        s.dma_phys = 0;
         s.dma_ok = false;
         s.dma_done = true;
         return;
-    }
-    mmio_write32(sys, phys, DMA_PATTERN);
-    dma_cache_op(sys, DMA_FLUSH, phys, 4);
-    dma_cache_op(sys, DMA_INVALIDATE, phys, 4);
-    let rb = mmio_read32(sys, phys);
+    };
+    s.dma_phys = region.addr;
+    let word = region.addr as usize as *mut u32;
+    core::ptr::write_volatile(word, DMA_PATTERN);
+    // Cache maintenance runs by whole lines: the invalidate needs a 64-byte
+    // aligned range.
+    dev_dma_flush(sys, region.handle, 0, 64);
+    dev_dma_invalidate(sys, region.handle, 0, 64);
+    let rb = core::ptr::read_volatile(word);
     s.dma_readback = rb;
     s.dma_ok = rb == DMA_PATTERN;
     s.dma_done = true;
@@ -197,6 +198,8 @@ pub unsafe extern "C" fn module_new(
         s.out_chan = out_chan;
         s.steps = 0;
         s.dma_done = false;
+        s.regs = -1;
+        s.regs_off = 0;
         s.dma_phys = 0;
         s.dma_readback = 0;
         s.dma_ok = false;
@@ -249,7 +252,17 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         // as steady-state recurring lines the UDP monitor is sure to observe.
         if s.steps == 1 || s.steps.is_multiple_of(LOG_EVERY) {
             let sys = &*s.syscalls;
-            let value = mmio_read32(sys, HEVC_MAIN_BASE + P1_VERSION);
+            if s.regs < 0 {
+                if let Some((regs, off)) = open_aperture_at(sys, HEVC_MAIN_BASE) {
+                    s.regs = regs;
+                    s.regs_off = off;
+                }
+            }
+            let value = if s.regs < 0 {
+                0
+            } else {
+                mmio_read32(sys, s.regs, s.regs_off + P1_VERSION)
+            };
             let mut line = [0u8; 32];
             let len = format_line(&mut line, value);
             dev_log(sys, 3, line.as_ptr(), len);

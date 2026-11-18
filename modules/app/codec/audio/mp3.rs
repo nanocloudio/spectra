@@ -10,10 +10,9 @@
 // minimp3's transforms and constants, so every target runs the same integer
 // arithmetic, including cores the kernel gives no FPU.
 
+use super::abi::contracts::audio_sample::format;
 use super::abi::SyscallTable;
-use super::{
-    dev_channel_ioctl, dev_log, fmt_i16_raw, fmt_u32_raw, IOCTL_NOTIFY, POLL_IN, POLL_OUT,
-};
+use super::{dev_log, fmt_i16_raw, fmt_u32_raw, POLL_IN, POLL_OUT};
 use fluxor_rt::StepReturn;
 
 // ============================================================================
@@ -2912,7 +2911,16 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> StepReturn {
     let input = s.input;
     let out_chan = s.out_chan;
 
-    if s.out_pos < s.out_len {
+    if s.out_pos < s.out_len && s.sample_rate != s.last_sent_rate && s.sample_rate > 0 {
+        // The PCM in `out_buf` follows the format record that states its
+        // rate; the record goes first, whole, or the PCM waits.
+        let rec = format::encode(s.sample_rate);
+        if (sys.channel_write)(out_chan, rec.as_ptr(), format::LEN) == format::LEN as i32 {
+            s.last_sent_rate = s.sample_rate;
+        }
+    }
+
+    if s.out_pos < s.out_len && (s.sample_rate == s.last_sent_rate || s.sample_rate == 0) {
         let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
         if out_poll > 0 && ((out_poll as u32) & POLL_OUT) != 0 {
             let remaining_bytes = ((s.out_len - s.out_pos) as usize) * 2;
@@ -3050,18 +3058,6 @@ pub unsafe fn mp3_step(s: &mut Mp3State) -> StepReturn {
             s.out_pos = 0;
             s.out_len = result as u16;
             s.frame_count = s.frame_count.wrapping_add(1);
-
-            if s.sample_rate != s.last_sent_rate && s.sample_rate > 0 {
-                let mut rate_buf = [0u8; 4];
-                let rb = rate_buf.as_mut_ptr();
-                let sr = s.sample_rate;
-                *rb = sr as u8;
-                *rb.add(1) = (sr >> 8) as u8;
-                *rb.add(2) = (sr >> 16) as u8;
-                *rb.add(3) = (sr >> 24) as u8;
-                dev_channel_ioctl(sys, out_chan, IOCTL_NOTIFY, rb, 4);
-                s.last_sent_rate = s.sample_rate;
-            }
 
             if s.frame_count & 63 == 0 && s.underrun_count > 0 {
                 let mut lb = [0u8; 48];

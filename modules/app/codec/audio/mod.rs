@@ -41,8 +41,8 @@ use super::input;
     reason = "the seam re-exports the root surface the whole subtree draws on; which subset is live depends on the enabled format features"
 )]
 use super::{
-    __aeabi_memclr, dev_channel_ioctl, dev_log, drain_pending, fmt_i16_raw, fmt_u32_raw, p_u32,
-    track_pending, E_AGAIN, IOCTL_NOTIFY, POLL_IN, POLL_OUT,
+    __aeabi_memclr, dev_log, drain_pending, fmt_i16_raw, fmt_u32_raw, p_u32, track_pending,
+    E_AGAIN, POLL_IN, POLL_OUT,
 };
 
 // `mp3.rs` is a fixed-point port of CC0 `minimp3`. Its value is being

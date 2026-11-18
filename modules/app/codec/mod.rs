@@ -1132,7 +1132,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             let has_hup = (poll as u32) & POLL_HUP != 0;
             let has_in = (poll as u32) & POLL_IN != 0;
             if has_hup && !has_in {
-                dev_channel_ioctl(sys, s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+                dev_channel_flush(sys, s.in_chan);
                 return StepReturn::Continue;
             }
             if !has_in {
@@ -1202,7 +1202,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 // Done: reset immediately. Error: hold (heartbeat
                 // replays last_err) until fresh bytes arrive.
                 if !errored || has_new {
-                    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+                    dev_channel_flush(s.sys(), s.in_chan);
                     dev_log(s.sys(), 3, b"[dec] rst-mkv".as_ptr(), 13);
                     reset_to_detect(s);
                     return StepReturn::Continue;
@@ -1231,7 +1231,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             };
             if has_hup && sub_done {
                 dev_log(&*sys_ptr, 3, b"[dec] rst-adv".as_ptr(), 13);
-                dev_channel_ioctl(&*sys_ptr, in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+                dev_channel_flush(&*sys_ptr, in_chan);
                 reset_to_detect(s);
                 return StepReturn::Continue;
             }
@@ -1244,7 +1244,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             if has_hup && !has_in {
                 s.hup_quiet_ticks = s.hup_quiet_ticks.saturating_add(1);
                 if s.hup_quiet_ticks >= HUP_QUIESCE_TICKS {
-                    dev_channel_ioctl(&*sys_ptr, in_chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+                    dev_channel_flush(&*sys_ptr, in_chan);
                     dev_log(&*sys_ptr, 3, b"[dec] rst".as_ptr(), 9);
                     reset_to_detect(s);
                     return StepReturn::Continue;
