@@ -21,7 +21,11 @@
 //! lazily on first byte / first decode so audio-only deployments don't pay
 //! the cost. Per-format scratch (LZW dictionary, JPEG tables, etc.) is
 //! `heap_alloc`'d inside the decoder and freed before return.
+//!
+//! A decoded image goes out as one `VideoRaster` region covering the whole
+//! surface: its `video_raster` header, then `pending[]`.
 
+use super::abi::contracts::video_raster as vr;
 use super::abi::SyscallTable;
 use super::dev_log;
 use fluxor_rt::StepReturn;
@@ -117,6 +121,9 @@ pub struct ImageState {
     pub(super) pending: *mut u8,
     pub(super) pending_size: u32,
     pub(super) pending_pos: u32,
+    /// The region header sent ahead of `pending[]`, and bytes of it sent.
+    header: [u8; vr::HEADER],
+    header_pos: u32,
 
     // state
     pub phase: Phase,
@@ -181,7 +188,9 @@ pub unsafe fn image_feed_detect(s: &mut ImageState, buf: *const u8, len: usize) 
 )]
 pub unsafe fn image_is_done(s: &ImageState) -> bool {
     matches!(s.phase, Phase::Error)
-        || (matches!(s.phase, Phase::Draining) && s.pending_pos >= s.pending_size)
+        || (matches!(s.phase, Phase::Draining)
+            && s.header_pos as usize >= vr::HEADER
+            && s.pending_pos >= s.pending_size)
 }
 
 // ── Step ──────────────────────────────────────────────────────────────────
@@ -219,6 +228,17 @@ pub unsafe fn image_step(s: &mut ImageState) -> StepReturn {
         }
 
         Phase::Draining => {
+            if (s.header_pos as usize) < vr::HEADER {
+                let w = ((*s.syscalls).channel_write)(
+                    s.out_chan,
+                    s.header.as_ptr().add(s.header_pos as usize),
+                    vr::HEADER - s.header_pos as usize,
+                );
+                if w > 0 {
+                    s.header_pos += w as u32;
+                }
+                return StepReturn::Continue;
+            }
             if s.pending_pos < s.pending_size {
                 let take = (s.pending_size - s.pending_pos).min(WRITE_CHUNK as u32);
                 let w = ((*s.syscalls).channel_write)(
@@ -455,6 +475,12 @@ pub(super) unsafe fn ensure_pending(s: &mut ImageState, dst_w: usize, dst_h: usi
         s.pending_size = dst_bytes as u32;
     }
     s.pending_pos = 0;
+    let header = vr::Header::whole(dst_w as u16, dst_h as u16, vr::FORMAT_RGB565);
+    if header.write(&mut s.header).is_none() {
+        log(s, b"[img] output raster has no extent");
+        return false;
+    }
+    s.header_pos = 0;
     true
 }
 

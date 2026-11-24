@@ -38,6 +38,7 @@
 use self::h264::decoder as h264_decoder;
 use self::h264::storage_t;
 use self::h264::Allocator;
+use super::abi::contracts::video_raster as vr;
 use super::abi::SyscallTable;
 use super::container::matroska::{
     parse_avcc, MkvDemux, MkvError, MkvSink, VideoCodec, VideoTrackInfo,
@@ -146,10 +147,13 @@ pub struct MkvH264State {
     crop_w: u32,
     crop_h: u32,
 
-    // RGB565 output staging
+    // RGB565 output staging: each picture one `VideoRaster` region covering
+    // the surface, `header` (and bytes of it sent) ahead of `pending[]`
     pending: *mut u8,
     pending_size: u32,
     pending_pos: u32,
+    header: [u8; vr::HEADER],
+    header_pos: u32,
 
     pub frames_out: u32,
     quiet_ticks: u32,
@@ -575,6 +579,17 @@ pub unsafe fn mkv_step(s: &mut MkvH264State) -> StepReturn {
         VPhase::Error | VPhase::Done => StepReturn::Continue,
 
         VPhase::Drain => {
+            if (s.header_pos as usize) < vr::HEADER {
+                let w = ((*s.syscalls).channel_write)(
+                    s.out_chan,
+                    s.header.as_ptr().add(s.header_pos as usize),
+                    vr::HEADER - s.header_pos as usize,
+                );
+                if w > 0 {
+                    s.header_pos += w as u32;
+                }
+                return StepReturn::Continue;
+            }
             if s.pending_pos < s.pending_size {
                 // Chunk size from the pixels edge's rate class when
                 // declared (`rate: video` → cadence-derived grant),
@@ -838,10 +853,17 @@ unsafe fn next_picture(s: &mut MkvH264State) -> bool {
         }
         s.pending = p;
     }
+    let header = vr::Header::whole(s.dst_w, s.dst_h, vr::FORMAT_RGB565);
+    if header.write(&mut s.header).is_none() {
+        set_err(s, b"[mkv] output raster has no extent");
+        s.phase = VPhase::Error;
+        return false;
+    }
     yuv420_to_rgb565(s, data);
     pts_pop(s);
     s.pending_size = dst_bytes;
     s.pending_pos = 0;
+    s.header_pos = 0;
     s.frames_out = s.frames_out.wrapping_add(1);
     true
 }
